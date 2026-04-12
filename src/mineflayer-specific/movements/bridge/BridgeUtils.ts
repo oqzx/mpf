@@ -170,9 +170,12 @@ export class OptimalLineTracker {
     if (baseBlock == null) return null
 
     const historyLine = this._fitLineFromHistory()
-    const origin = (historyLine != null && historyLine.direction.dot(direction) > 0.5)
-      ? historyLine.origin
-      : baseBlock.offset(0.5, 0, 0.5)
+    let origin: Vec3
+    if (historyLine != null && historyLine.direction.dot(direction) > 0.5) {
+      origin = historyLine.origin
+    } else {
+      origin = baseBlock.offset(0.5, 0, 0.5)
+    }
 
     return { origin: new Vec3(origin.x, bot.entity.position.y, origin.z), direction }
   }

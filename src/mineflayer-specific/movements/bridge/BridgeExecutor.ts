@@ -96,6 +96,9 @@ export class BridgeExecutor extends MovementExecutor {
     this.lineTracker.reset()
     this._forceStopMovementThisTick = false
 
+    const pf = (this.bot as any).pathfinder
+    if (pf != null) pf.suppressPathReset = true
+
     if (this._isInWater()) {
       await this.postInitAlignToPath(thisMove)
       return
@@ -133,7 +136,7 @@ export class BridgeExecutor extends MovementExecutor {
       return false
     }
 
-    if (!bot.entity.onGround && pos.y < Math.round(thisMove.entryPos.y) - 1) {
+    if (!bot.entity.onGround && pos.y < Math.round(thisMove.entryPos.y) - 3) {
       throw new CancelError('BridgeExecutor: fell off path')
     }
 
@@ -202,10 +205,21 @@ export class BridgeExecutor extends MovementExecutor {
     if (execComplete) {
       const delta = this.splicedEndIndex - currentIndex
       this.mode.onMoveEnd()
+      this._clearSuppressPathReset()
       return delta > 0 ? delta : true
     }
 
     return false
+  }
+
+  override reset (): void {
+    this._clearSuppressPathReset()
+    super.reset()
+  }
+
+  private _clearSuppressPathReset (): void {
+    const pf = (this.bot as any).pathfinder
+    if (pf != null) pf.suppressPathReset = false
   }
 
   private _refreshLerp (): void {
@@ -320,27 +334,6 @@ export class BridgeExecutor extends MovementExecutor {
     return false
   }
 
-  private async _attemptPlacement (path: Move[], startIndex: number): Promise<boolean> {
-    for (let i = startIndex; i <= this.splicedEndIndex; i++) {
-      const m = path[i]
-      if (m == null) break
-
-      for (const place of m.toPlace) {
-        if (place.done) continue
-        if (place.isPerforming) continue
-        if (!(place instanceof PlaceHandler)) continue
-        if (!place.needToPerform(this.bot)) continue
-
-        const item = place.getItem(this.bot)
-        if (item == null) continue
-
-        void place._perform(this.bot, item, {}).catch(() => {})
-        return true
-      }
-    }
-    return false
-  }
-
   private async _attemptBreak (move: Move): Promise<void> {
     for (const breakHandler of move.toBreak) {
       if (breakHandler.done) continue
@@ -358,7 +351,7 @@ export class BridgeExecutor extends MovementExecutor {
 
   private _applyMovement (
     move: Move,
-    modeResult: { wantSneak: boolean, wantJump: boolean, movementOverride: Vec3 | null },
+    modeResult: { wantSneak: boolean, wantJump: boolean, wantSprint: boolean, movementOverride: Vec3 | null },
     nowMs: number
   ): void {
     const bot = this.bot
@@ -387,6 +380,7 @@ export class BridgeExecutor extends MovementExecutor {
 
     bot.setControlState('sneak', finalSneak)
     bot.setControlState('jump', finalJump)
+    bot.setControlState('sprint', modeResult.wantSprint && !finalSneak)
 
     if (modeResult.movementOverride != null) {
       const ov = modeResult.movementOverride
@@ -395,37 +389,11 @@ export class BridgeExecutor extends MovementExecutor {
         bot.setControlState('back', false)
         bot.setControlState('left', false)
         bot.setControlState('right', false)
-        bot.setControlState('sprint', false)
       } else {
         this._applyDirectionalVector(ov)
-        this._applySprintState(finalSneak)
       }
     } else {
-      void this.postInitAlignToPath(move, { sprint: !finalSneak })
-      if (this.bridgeConfig.mode !== 'normal') {
-        bot.setControlState('sprint', !finalSneak)
-      }
-    }
-  }
-
-  private _applySprintState (finalSneak: boolean): void {
-    const bot = this.bot
-    const cfg = this.bridgeConfig
-
-    if (cfg.mode !== 'normal') {
-      bot.setControlState('sprint', !finalSneak)
-      return
-    }
-
-    const sprintMode = cfg.normal.sprint
-    if (sprintMode === 'always') {
-      bot.setControlState('sprint', !finalSneak)
-    } else if (sprintMode === 'auto') {
-      const vel = bot.entity.velocity
-      const xzSpeed = Math.sqrt(vel.x * vel.x + vel.z * vel.z)
-      bot.setControlState('sprint', !finalSneak && xzSpeed > 0.08)
-    } else {
-      bot.setControlState('sprint', false)
+      void this.postInitAlignToPath(move, { sprint: modeResult.wantSprint && !finalSneak })
     }
   }
 

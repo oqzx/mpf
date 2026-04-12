@@ -136,6 +136,14 @@ export class ThePathfinder {
   public abortCalculation = false
   private userAborted = false
 
+  /**
+   * When true, blockUpdate events will not trigger a path reset.
+   * Set by BridgeExecutor during active bridge execution so that
+   * the block-placed event from the block we just placed cannot
+   * interrupt the path mid-air.
+   */
+  public suppressPathReset = false
+
   private currentGotoGoal?: goals.Goal
   private curPath?: Move[]
   private currentMove?: Move
@@ -277,6 +285,14 @@ export class ThePathfinder {
     // this can be done once.
     this.bot.on('blockUpdate', (oldblock, newBlock: Block | null) => {
       if (oldblock == null || newBlock == null) return
+
+      // BridgeExecutor sets this flag while it is actively bridging so that
+      // block-placed events from blocks we just placed cannot fire a path
+      // reset while the bot is still mid-air over the new block.
+      if (this.suppressPathReset) {
+        console.log(`[dbg blockUpdate] suppressed (bridge active) pos=${oldblock.position.toArray()} old=${oldblock.name} new=${newBlock?.name}`)
+        return
+      }
 
       // TODO: sync to calculation phase as well. Not just execution time.
       if (this.curPath == null) { console.log(`[dbg blockUpdate] skipped (no curPath) pos=${oldblock.position.toArray()}`); return }

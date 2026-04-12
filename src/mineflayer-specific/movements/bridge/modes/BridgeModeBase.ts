@@ -1,9 +1,8 @@
-import { Bot } from 'mineflayer'
 import { Vec3 } from 'vec3'
-import { Move } from '../../../move'
-import { World } from '../../../world/worldInterface'
 import { OptimalLineTracker } from '../BridgeUtils'
-import { BridgeConfig } from '../BridgeConfig'
+import { Move } from '../../../move'
+import { Bot } from 'mineflayer'
+import { World } from '../../../world/worldInterface'
 
 export interface TickContext {
   move: Move
@@ -16,36 +15,34 @@ export interface TickContext {
 }
 
 export interface ModeTickResult {
-  wantSneak: boolean
-  wantJump: boolean
-  movementOverride: Vec3 | null
   targetYaw: number | null
   targetPitch: number | null
   allowPlace: boolean
+  wantSneak: boolean
+  wantJump: boolean
+  wantSprint: boolean
+  movementOverride: Vec3 | null
 }
 
 export const DEFAULT_TICK_RESULT: ModeTickResult = {
-  wantSneak: false,
-  wantJump: false,
-  movementOverride: null,
   targetYaw: null,
   targetPitch: null,
-  allowPlace: true
+  allowPlace: false,
+  wantSneak: false,
+  wantJump: false,
+  wantSprint: true,
+  movementOverride: null
 }
 
 export abstract class BridgeModeBase {
-  protected readonly bot: Bot
-  protected readonly world: World
-  protected readonly config: BridgeConfig
+  constructor(
+    protected readonly bot: Bot,
+    protected readonly world: World,
+    protected readonly config: any
+  ) {}
 
-  constructor (bot: Bot, world: World, config: BridgeConfig) {
-    this.bot = bot
-    this.world = world
-    this.config = config
-  }
-
-  abstract onMoveStart (ctx: TickContext): void
-  abstract onTick (ctx: TickContext): ModeTickResult
-  abstract onBlockPlaced (ctx: TickContext): void
-  abstract onMoveEnd (): void
+  abstract onMoveStart(ctx: TickContext): void
+  abstract onTick(ctx: TickContext): ModeTickResult
+  abstract onBlockPlaced(ctx: TickContext): void
+  abstract onMoveEnd(): void
 }

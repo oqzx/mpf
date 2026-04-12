@@ -48,6 +48,7 @@ export class NormalMode extends BridgeModeBase {
       result.targetYaw = rawMovingYaw
       result.targetPitch = this.currentPitch
       result.allowPlace = false
+      result.wantSprint = true
 
       if (onGround && this._atPlatformEdge(backX, backZ)) {
         this.phase = 'bridge'
@@ -77,6 +78,7 @@ export class NormalMode extends BridgeModeBase {
       result.targetPitch = this.currentPitch
       result.movementOverride = new Vec3(0, 0, 0)
       result.allowPlace = false
+      result.wantSprint = false
       return result
     }
 
@@ -97,6 +99,7 @@ export class NormalMode extends BridgeModeBase {
     result.targetYaw = ninjaYaw
     result.targetPitch = this.currentPitch
     result.allowPlace = this.shouldBridge && this._shouldAllowPlace(ctx, backX, backZ)
+    result.wantSprint = false
 
     if (!inSafeWalk) {
       let movX = ninjaVec.x
@@ -105,12 +108,21 @@ export class NormalMode extends BridgeModeBase {
       if (line != null) {
         const corr = ctx.lineTracker.getCorrectionDir(bot, line)
         if (corr.norm() > 0.001) {
-          movX += corr.x * 0.3
-          movZ += corr.z * 0.3
+          movX += corr.x * 0.9
+          movZ += corr.z * 0.9
         }
       }
-      const movLen = Math.sqrt(movX * movX + movZ * movZ)
-      result.movementOverride = new Vec3(movX / movLen, 0, movZ / movLen)
+      let movLen = Math.sqrt(movX * movX + movZ * movZ)
+      if (movLen < 0.001) {
+        result.movementOverride = new Vec3(0, 0, 0)
+      } else {
+        const normX = movX / movLen
+        const normZ = movZ / movLen
+        if (overAir && onGround) {
+          movLen *= 0.4
+        }
+        result.movementOverride = new Vec3(normX * movLen, 0, normZ * movLen)
+      }
     } else {
       result.movementOverride = new Vec3(0, 0, 0)
     }
@@ -149,18 +161,31 @@ export class NormalMode extends BridgeModeBase {
 
   private _atPlatformEdge (backX: number, backZ: number): boolean {
     const bot = this.bot
-    if (!bot.entity.onGround) return false
-
     const pos = bot.entity.position
-    const stepX = Math.round(backX)
-    const stepZ = Math.round(backZ)
     const groundY = Math.floor(pos.y) - 1
-
     const bx = Math.round(pos.x)
     const bz = Math.round(pos.z)
 
+    if (!bot.entity.onGround) {
+      const stepX = Math.round(backX)
+      const stepZ = Math.round(backZ)
+      if (!this.world.getBlockInfo(new Vec3(bx + stepX, groundY, bz + stepZ)).physical) return true
+      if (stepX !== 0 && !this.world.getBlockInfo(new Vec3(bx + stepX, groundY, bz)).physical) return true
+      if (stepZ !== 0 && !this.world.getBlockInfo(new Vec3(bx, groundY, bz + stepZ)).physical) return true
+      return false
+    }
+
     const underFeet = this.world.getBlockInfo(new Vec3(bx, groundY, bz))
     if (!underFeet.physical && !underFeet.liquid) return false
+
+    const stepX = Math.round(backX)
+    const stepZ = Math.round(backZ)
+
+    if (stepX !== 0 && stepZ !== 0) {
+      const cardX = this.world.getBlockInfo(new Vec3(bx + stepX, groundY, bz))
+      const cardZ = this.world.getBlockInfo(new Vec3(bx, groundY, bz + stepZ))
+      if ((!cardX.physical && !cardX.liquid) || (!cardZ.physical && !cardZ.liquid)) return true
+    }
 
     const underNext = this.world.getBlockInfo(new Vec3(bx + stepX, groundY, bz + stepZ))
     return !underNext.physical && !underNext.liquid
