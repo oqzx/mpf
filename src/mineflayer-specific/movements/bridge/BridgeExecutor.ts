@@ -8,7 +8,7 @@ import { BreakHandler, PlaceHandler } from '../interactionUtils'
 import { BlockInfo } from '../../world/cacheWorld'
 import { CancelError } from '../../exceptions'
 import * as goals from '../../goals'
-import { randFloat, randRangeMs, shortestYawDelta, OptimalLineTracker } from './BridgeUtils'
+import { randFloat, randRangeMs, shortestYawDelta, OptimalLineTracker, RAD2DEG } from './BridgeUtils'
 import { BridgeConfig, DEFAULT_BRIDGE_CONFIG } from './BridgeConfig'
 import { BridgeModeBase, TickContext } from './modes/BridgeModeBase'
 import { NormalMode } from './modes/NormalMode'
@@ -27,15 +27,14 @@ export class BridgeExecutor extends MovementExecutor {
   private placedThisMove = 0
   private placementCooldownUntilMs = 0
   private nextPlacementDelayMs = 0
-
+  private _nextMouseClickMs = 0
   private elevated = false
   private elevatedJumpCooldownUntilMs = 0
-
   private splicedEndIndex = 0
   private stallStartMs = 0
-
   private _lerpYaw = 0.4
   private _lerpPitch = 0.45
+  private _forceStopMovementThisTick = false
 
   constructor (bot: Bot, world: World, settings: Partial<MovementOptions> = {}, cfg: Partial<BridgeConfig> = {}) {
     super(bot, world, settings)
@@ -72,7 +71,6 @@ export class BridgeExecutor extends MovementExecutor {
   override async align (thisMove: Move, tickCount: number, goal: goals.Goal): Promise<boolean> {
     const pos = this.bot.entity.position
     const aligned = this.isInitAligned(thisMove, thisMove.entryPos.floored().offset(0.5, 0, 0.5))
-    console.log(`[dbg align] tick=${tickCount} onGround=${this.bot.entity.onGround} pos=(${pos.x.toFixed(2)},${pos.y.toFixed(2)},${pos.z.toFixed(2)}) entryPos=(${thisMove.entryPos.x.toFixed(2)},${thisMove.entryPos.y.toFixed(2)},${thisMove.entryPos.z.toFixed(2)}) exitPos=(${thisMove.exitPos.x.toFixed(2)},${thisMove.exitPos.y.toFixed(2)},${thisMove.exitPos.z.toFixed(2)}) aligned=${aligned}`)
 
     if (this._isInWater()) {
       await super.align(thisMove, tickCount, goal)
@@ -82,8 +80,6 @@ export class BridgeExecutor extends MovementExecutor {
 
     if (!this.bot.entity.onGround && pos.y > thisMove.entryPos.y + 0.1) return false
 
-    // Must drive movement, not just look — otherwise the bot freezes after execComplete
-    // postInitAlignToPath handles looking at exitPos AND setting forward/back controls
     void this.postInitAlignToPath(thisMove)
     return aligned
   }
@@ -95,8 +91,10 @@ export class BridgeExecutor extends MovementExecutor {
     this.placementCooldownUntilMs = 0
     this.stallStartMs = 0
     this.nextPlacementDelayMs = randRangeMs(this.bridgeConfig.placementDelayMs)
+    this._nextMouseClickMs = 0
     this._refreshLerp()
     this.lineTracker.reset()
+    this._forceStopMovementThisTick = false
 
     if (this._isInWater()) {
       await this.postInitAlignToPath(thisMove)
@@ -123,7 +121,7 @@ export class BridgeExecutor extends MovementExecutor {
     const pos = bot.entity.position
     const now = Date.now()
 
-    console.log(`[dbg ppt] tick=${tickCount} onGround=${bot.entity.onGround} pos=(${pos.x.toFixed(2)},${pos.y.toFixed(2)},${pos.z.toFixed(2)}) entryY=${thisMove.entryPos.y.toFixed(2)} exitPos=(${thisMove.exitPos.x.toFixed(2)},${thisMove.exitPos.y.toFixed(2)},${thisMove.exitPos.z.toFixed(2)}) stall=${this.stallStartMs > 0 ? now - this.stallStartMs : 0}ms placed=${this.placedThisMove}`)
+    this._forceStopMovementThisTick = false
 
     if (this._isInWater()) {
       if (pos.y < thisMove.exitPos.y) bot.setControlState('jump', true)
@@ -136,7 +134,6 @@ export class BridgeExecutor extends MovementExecutor {
     }
 
     if (!bot.entity.onGround && pos.y < Math.round(thisMove.entryPos.y) - 1) {
-      console.log(`[dbg ppt] CANCEL: fell off path pos.y=${pos.y} threshold=${Math.round(thisMove.entryPos.y) - 1}`)
       throw new CancelError('BridgeExecutor: fell off path')
     }
 
@@ -145,7 +142,6 @@ export class BridgeExecutor extends MovementExecutor {
     if (!bot.entity.onGround && (collidedH || xzSpeed < 0.01)) {
       if (this.stallStartMs === 0) this.stallStartMs = now
       if (now - this.stallStartMs > this.bridgeConfig.stallTimeoutMs) {
-        console.log(`[dbg ppt] CANCEL: stalled horizontally for ${now - this.stallStartMs}ms collidedH=${collidedH} xzSpeed=${xzSpeed.toFixed(4)}`)
         throw new CancelError('BridgeExecutor: stalled horizontally')
       }
     } else {
@@ -157,14 +153,14 @@ export class BridgeExecutor extends MovementExecutor {
 
     this._applyRotation(thisMove, modeResult.targetYaw, modeResult.targetPitch)
 
-    console.log(`[dbg ppt] allowPlace=${modeResult.allowPlace} cooldown=${Math.max(0, this.placementCooldownUntilMs - now)}ms targetYaw=${modeResult.targetYaw?.toFixed(3) ?? 'null'} targetPitch=${modeResult.targetPitch?.toFixed(3) ?? 'null'}`)
-    if (modeResult.allowPlace && now >= this.placementCooldownUntilMs) {
-      const placed = await this._attemptPlacement(path, currentIndex)
-      console.log(`[dbg ppt] _attemptPlacement returned ${placed}`)
+    if (modeResult.allowPlace && now >= this.placementCooldownUntilMs && now >= this._nextMouseClickMs) {
+      const placed = await this._attemptMousePlacement(path, currentIndex)
       if (placed) {
         this.placedThisMove++
         this.placementCooldownUntilMs = now + this.nextPlacementDelayMs
         this.nextPlacementDelayMs = randRangeMs(this.bridgeConfig.placementDelayMs)
+        this._nextMouseClickMs = now + (1000 / (4 + Math.random() * 2))
+        this._forceStopMovementThisTick = true
         const updatedCtx = this._makeCtx(thisMove, currentIndex, path)
         this.mode.onBlockPlaced(updatedCtx)
         this._refreshLerp()
@@ -178,9 +174,31 @@ export class BridgeExecutor extends MovementExecutor {
 
     this._applyMovement(thisMove, modeResult, now)
 
+    {
+      const p    = bot.entity.position
+      const vel  = bot.entity.velocity
+      const xzSpd = Math.sqrt(vel.x ** 2 + vel.z ** 2).toFixed(3)
+      const yawDeg   = (bot.entity.yaw   * RAD2DEG).toFixed(1)
+      const pitchDeg = (bot.entity.pitch * RAD2DEG).toFixed(1)
+      const sneak = bot.getControlState('sneak')
+      const jump  = bot.getControlState('jump')
+      const fwd   = bot.getControlState('forward')
+      const back  = bot.getControlState('back')
+      const left  = bot.getControlState('left')
+      const right = bot.getControlState('right')
+      const sprint = bot.getControlState('sprint')
+      console.log(
+        `[bridge tick] t=${tickCount} pos=(${p.x.toFixed(2)},${p.y.toFixed(2)},${p.z.toFixed(2)}) ` +
+        `yaw=${yawDeg}° pitch=${pitchDeg}° ` +
+        `sneak=${sneak} jump=${jump} sprint=${sprint} fwd=${fwd} back=${back} left=${left} right=${right} ` +
+        `onGnd=${bot.entity.onGround} xzSpd=${xzSpd} ` +
+        `placed=${this.placedThisMove} allowPlace=${modeResult.allowPlace} ` +
+        `vel=(${vel.x.toFixed(3)},${vel.y.toFixed(3)},${vel.z.toFixed(3)})`
+      )
+    }
+
     const targetMove = path[this.splicedEndIndex] ?? thisMove
     const execComplete = this._isExecutionComplete(thisMove, targetMove, path, currentIndex)
-    console.log(`[dbg ppt] execComplete=${execComplete} splicedEnd=${this.splicedEndIndex} idx=${currentIndex}`)
     if (execComplete) {
       const delta = this.splicedEndIndex - currentIndex
       this.mode.onMoveEnd()
@@ -234,8 +252,6 @@ export class BridgeExecutor extends MovementExecutor {
     const xzDist = Math.sqrt((pos.x - x) ** 2 + (pos.z - z) ** 2)
     if (xzDist <= this.bridgeConfig.elevatedBridgeThreshold) return false
 
-    // Only elevate-jump if the goal is meaningfully higher than current position.
-    // Flat bridges should never jump – jumping breaks placement timing.
     const goalY = (goal as any).y ?? (goal as any).entity?.position?.y
     if (goalY == null) return false
     return goalY - pos.y > 1
@@ -260,11 +276,13 @@ export class BridgeExecutor extends MovementExecutor {
     }
 
     const rawStep = dyaw * this._lerpYaw
-    const step = Math.abs(rawStep) < BridgeExecutor.MIN_YAW_DELTA_RAD
-      ? Math.sign(rawStep !== 0 ? rawStep : 1) * BridgeExecutor.MIN_YAW_DELTA_RAD
-      : rawStep
+    const step = Math.abs(dyaw) <= BridgeExecutor.MIN_YAW_DELTA_RAD
+      ? dyaw
+      : (Math.abs(rawStep) < BridgeExecutor.MIN_YAW_DELTA_RAD
+          ? Math.sign(rawStep !== 0 ? rawStep : 1) * BridgeExecutor.MIN_YAW_DELTA_RAD
+          : rawStep)
 
-    this.bot.entity.yaw = currentYaw + step + randFloat(-0.005, 0.005)
+    this.bot.entity.yaw = currentYaw + step
     this.bot.entity.pitch = currentPitch + (pitch - currentPitch) * this._lerpPitch
   }
 
@@ -275,6 +293,31 @@ export class BridgeExecutor extends MovementExecutor {
 
   private _defaultPitch (): number {
     return -(70 * (Math.PI / 180))
+  }
+
+  private async _attemptMousePlacement (path: Move[], startIndex: number): Promise<boolean> {
+    for (let i = startIndex; i <= this.splicedEndIndex; i++) {
+      const m = path[i]
+      if (m == null) break
+
+      for (const place of m.toPlace) {
+        if (place.done) continue
+        if (place.isPerforming) continue
+        if (!(place instanceof PlaceHandler)) continue
+        if (!place.needToPerform(this.bot)) continue
+
+        const item = place.getItem(this.bot)
+        if (item == null) continue
+
+        if (place.getCurrentItem(this.bot) !== item) {
+          await place.equipItem(this.bot, item)
+        }
+
+        void (this.bot as any).rightClick()
+        return true
+      }
+    }
+    return false
   }
 
   private async _attemptPlacement (path: Move[], startIndex: number): Promise<boolean> {
@@ -319,6 +362,17 @@ export class BridgeExecutor extends MovementExecutor {
     nowMs: number
   ): void {
     const bot = this.bot
+
+    if (this._forceStopMovementThisTick) {
+      bot.setControlState('forward', false)
+      bot.setControlState('back', false)
+      bot.setControlState('left', false)
+      bot.setControlState('right', false)
+      bot.setControlState('sprint', false)
+      bot.setControlState('sneak', true)
+      bot.setControlState('jump', false)
+      return
+    }
 
     const needsElevatedJump = this.elevated &&
       nowMs >= this.elevatedJumpCooldownUntilMs &&
@@ -384,10 +438,10 @@ export class BridgeExecutor extends MovementExecutor {
     const fwdDot = -sinYaw * vec.x - cosYaw * vec.z
     const rightDot = -cosYaw * vec.x + sinYaw * vec.z
 
-    bot.setControlState('forward', fwdDot > 0.3)
-    bot.setControlState('back', fwdDot < -0.3)
-    bot.setControlState('right', rightDot > 0.3)
-    bot.setControlState('left', rightDot < -0.3)
+    bot.setControlState('forward', fwdDot > 0)
+    bot.setControlState('back',    fwdDot < 0)
+    bot.setControlState('right',   rightDot > 0)
+    bot.setControlState('left',    rightDot < 0)
   }
 
   private _makeCtx (

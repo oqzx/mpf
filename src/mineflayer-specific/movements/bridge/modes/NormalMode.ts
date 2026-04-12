@@ -1,116 +1,169 @@
 import { Vec3 } from 'vec3'
 import {
-  isCloseToEdge,
   pitchFromDeg,
   randFloat,
-  randRangeMs,
   dirFromYaw,
-  GodBridgeSideTracker,
+  shortestYawDelta,
+  wrapRadians,
   PlacementPredictor,
-  DEG2RAD
+  DEG2RAD,
+  RAD2DEG
 } from '../BridgeUtils'
 import { BridgeModeBase, ModeTickResult, TickContext, DEFAULT_TICK_RESULT } from './BridgeModeBase'
 
-export class NormalMode extends BridgeModeBase {
-  private readonly sideTracker = new GodBridgeSideTracker()
-  private readonly placementPredictor = new PlacementPredictor()
+const NINJA_ALIGN_THRESH_DEG = 5
+const NINJA_PITCH_THRESH_DEG = 1.5
 
-  private placedBlocks = 0
-  private blocksToEagleThreshold = 0
-  private sneakUntilMs = 0
+type BridgePhase = 'approach' | 'bridge'
+
+export class NormalMode extends BridgeModeBase {
+  private readonly placementPredictor = new PlacementPredictor()
+  private phase: BridgePhase = 'approach'
   private currentPitch = 0
   private currentYawBias = 0
+  private shouldBridge = false
+  private _safeWalkUntilMs = 0
 
   onMoveStart (ctx: TickContext): void {
-    this.sideTracker.reset()
+    this.phase = 'approach'
     this.placementPredictor.reset()
-    this.placedBlocks = 0
-    this.blocksToEagleThreshold = this._nextEagleThreshold()
-    this.sneakUntilMs = 0
     this.currentPitch = this._nextPitch()
     this.currentYawBias = this._nextYawBias()
+    this.shouldBridge = false
+    this._safeWalkUntilMs = 0
   }
 
   onTick (ctx: TickContext): ModeTickResult {
-    const result: ModeTickResult = { ...DEFAULT_TICK_RESULT }
-    const cfg = this.config.normal
     const bot = this.bot
-    const now = ctx.nowMs
-
-    // movingYaw = toward exit (actual direction of travel)
-    // facingYaw = away from exit (bot faces backward while bridging)
-    const movingYaw = this._exitPosYaw(ctx)
+    const dx = ctx.move.exitPos.x - ctx.move.entryPos.x
+    const dz = ctx.move.exitPos.z - ctx.move.entryPos.z
+    const rawMovingYaw = Math.atan2(-dx, -dz)
+    const movingYaw = rawMovingYaw + this.currentYawBias
     const facingYaw = movingYaw + Math.PI
-
     const { dx: backX, dz: backZ } = dirFromYaw(movingYaw)
-    const rightX = backZ
-    const rightZ = -backX
-
     const onGround = bot.entity.onGround
-    const shouldCheckEdge = onGround || !cfg.onlyOnGround
 
-    if (shouldCheckEdge && this.placedBlocks === 0) {
-      if (isCloseToEdge(bot, this.world, backX, backZ, cfg.edgeDistance)) {
+    if (this.phase === 'approach') {
+      const result: ModeTickResult = { ...DEFAULT_TICK_RESULT }
+      result.targetYaw = rawMovingYaw
+      result.targetPitch = this.currentPitch
+      result.allowPlace = false
+
+      if (onGround && this._atPlatformEdge(backX, backZ)) {
+        this.phase = 'bridge'
+        this.shouldBridge = true
         result.wantSneak = true
+        result.movementOverride = new Vec3(0, 0, 0)
+        console.log(
+          `[ninja dbg] APPROACH->BRIDGE edge detected ` +
+          `pos=(${bot.entity.position.x.toFixed(2)},${bot.entity.position.y.toFixed(2)},${bot.entity.position.z.toFixed(2)}) ` +
+          `yaw=${(bot.entity.yaw * RAD2DEG).toFixed(1)}`
+        )
+      } else {
+        result.movementOverride = null
       }
+      return result
     }
 
-    if (now < this.sneakUntilMs) {
+    const ninjaYaw = this._snapToNinjaDiagonal(facingYaw)
+    const ninjaVec = this._ninjaStrafVec(ninjaYaw)
+
+    const yawErr = Math.abs(shortestYawDelta(bot.entity.yaw, ninjaYaw))
+    const pitchErr = Math.abs((bot.entity.pitch - this.currentPitch) * RAD2DEG)
+    if (yawErr > NINJA_ALIGN_THRESH_DEG * DEG2RAD || pitchErr > NINJA_PITCH_THRESH_DEG) {
+      const result: ModeTickResult = { ...DEFAULT_TICK_RESULT }
       result.wantSneak = true
+      result.targetYaw = ninjaYaw
+      result.targetPitch = this.currentPitch
+      result.movementOverride = new Vec3(0, 0, 0)
+      result.allowPlace = false
+      return result
     }
 
-    // No sideTracker correction in NormalMode — the GodBridgeSideTracker strafing
-    // causes circular drift on straight/diagonal bridges. Just move directly toward exit.
-    let movX = backX
-    let movZ = backZ
+    const overAir = this._atPlatformEdge(backX, backZ)
 
-    const line = ctx.lineTracker.getOptimalLine(bot, this.world)
-    if (line != null) {
-      const corr = ctx.lineTracker.getCorrectionDir(bot, line)
-      if (corr.norm() > 0.001) {
-        movX += corr.x * 0.25
-        movZ += corr.z * 0.25
-      }
-    }
+    console.log(
+      `[ninja dbg] phase=bridge safeWalk=${ctx.nowMs < this._safeWalkUntilMs} overAir=${overAir} onGround=${onGround} ` +
+      `yaw=${(bot.entity.yaw * RAD2DEG).toFixed(1)} pitch=${(bot.entity.pitch * RAD2DEG).toFixed(1)} ` +
+      `pos=(${bot.entity.position.x.toFixed(2)},${bot.entity.position.y.toFixed(2)},${bot.entity.position.z.toFixed(2)}) ` +
+      `vel=(${bot.entity.velocity.x.toFixed(3)},${bot.entity.velocity.y.toFixed(3)},${bot.entity.velocity.z.toFixed(3)}) ` +
+      `placed=${ctx.placedThisMove}`
+    )
 
-    const movLen = Math.sqrt(movX * movX + movZ * movZ)
-    result.movementOverride = new Vec3(movX / movLen, 0, movZ / movLen)
+    const result: ModeTickResult = { ...DEFAULT_TICK_RESULT }
+    const inSafeWalk = ctx.nowMs < this._safeWalkUntilMs
 
-    result.targetYaw = facingYaw
+    result.wantSneak = inSafeWalk
+    result.targetYaw = ninjaYaw
     result.targetPitch = this.currentPitch
+    result.allowPlace = this.shouldBridge && this._shouldAllowPlace(ctx, backX, backZ)
 
-    result.allowPlace = this._shouldAllowPlace(ctx, backX, backZ)
+    if (!inSafeWalk) {
+      let movX = ninjaVec.x
+      let movZ = ninjaVec.z
+      const line = ctx.lineTracker.getOptimalLine(bot, this.world)
+      if (line != null) {
+        const corr = ctx.lineTracker.getCorrectionDir(bot, line)
+        if (corr.norm() > 0.001) {
+          movX += corr.x * 0.3
+          movZ += corr.z * 0.3
+        }
+      }
+      const movLen = Math.sqrt(movX * movX + movZ * movZ)
+      result.movementOverride = new Vec3(movX / movLen, 0, movZ / movLen)
+    } else {
+      result.movementOverride = new Vec3(0, 0, 0)
+    }
 
     return result
   }
 
   onBlockPlaced (ctx: TickContext): void {
     const bot = this.bot
-    const movingYaw = this._exitPosYaw(ctx)
-    const facingYaw = movingYaw + Math.PI
+    const dx = ctx.move.exitPos.x - ctx.move.entryPos.x
+    const dz = ctx.move.exitPos.z - ctx.move.entryPos.z
+    const movingYaw = Math.atan2(-dx, -dz) + this.currentYawBias
     const { dx: backX, dz: backZ } = dirFromYaw(movingYaw)
     const edgePos = this._computeEdgePos(bot.entity.position, backX, backZ)
     this.placementPredictor.record(bot.entity.position, edgePos)
 
-    this.placedBlocks++
+    this._safeWalkUntilMs = ctx.nowMs + randFloat(100, 150)
+
+    console.log(
+      `[ninja dbg] BLOCK PLACED placedTotal=${ctx.placedThisMove + 1} safeWalkFor=${(this._safeWalkUntilMs - ctx.nowMs).toFixed(0)}ms ` +
+      `pos=(${bot.entity.position.x.toFixed(2)},${bot.entity.position.y.toFixed(2)},${bot.entity.position.z.toFixed(2)}) ` +
+      `yaw=${(bot.entity.yaw * RAD2DEG).toFixed(1)} pitch=${(bot.entity.pitch * RAD2DEG).toFixed(1)}`
+    )
+
     this.currentPitch = this._nextPitch()
     this.currentYawBias = this._nextYawBias()
-
-    if (this.placedBlocks > this.blocksToEagleThreshold) {
-      this.placedBlocks = 0
-      this.blocksToEagleThreshold = this._nextEagleThreshold()
-    }
-
-    const sneakDuration = randRangeMs(this.config.globalSneakMs)
-    this.sneakUntilMs = Math.max(this.sneakUntilMs, ctx.nowMs + sneakDuration)
   }
 
   onMoveEnd (): void {
-    this.sideTracker.reset()
+    this.phase = 'approach'
     this.placementPredictor.reset()
-    this.placedBlocks = 0
-    this.sneakUntilMs = 0
+    this.shouldBridge = false
     this.currentYawBias = 0
+    this._safeWalkUntilMs = 0
+  }
+
+  private _atPlatformEdge (backX: number, backZ: number): boolean {
+    const bot = this.bot
+    if (!bot.entity.onGround) return false
+
+    const pos = bot.entity.position
+    const stepX = Math.round(backX)
+    const stepZ = Math.round(backZ)
+    const groundY = Math.floor(pos.y) - 1
+
+    const bx = Math.round(pos.x)
+    const bz = Math.round(pos.z)
+
+    const underFeet = this.world.getBlockInfo(new Vec3(bx, groundY, bz))
+    if (!underFeet.physical && !underFeet.liquid) return false
+
+    const underNext = this.world.getBlockInfo(new Vec3(bx + stepX, groundY, bz + stepZ))
+    return !underNext.physical && !underNext.liquid
   }
 
   private _shouldAllowPlace (ctx: TickContext, backX: number, backZ: number): boolean {
@@ -119,11 +172,8 @@ export class NormalMode extends BridgeModeBase {
 
     const bot = this.bot
     const edgePos = this._computeEdgePos(bot.entity.position, backX, backZ)
-    const currentOffset = bot.entity.position.minus(edgePos)
-    const dx = currentOffset.x - avg.x
-    const dz = currentOffset.z - avg.z
-    const dist = Math.sqrt(dx * dx + dz * dz)
-
+    const off = bot.entity.position.minus(edgePos)
+    const dist = Math.sqrt((off.x - avg.x) ** 2 + (off.z - avg.z) ** 2)
     return dist <= this.config.normal.placementPredictorThreshold
   }
 
@@ -135,26 +185,33 @@ export class NormalMode extends BridgeModeBase {
     )
   }
 
-  private _exitPosYaw (ctx: TickContext): number {
-    const pos = this.bot.entity.position
-    const dx = ctx.move.exitPos.x - pos.x
-    const dz = ctx.move.exitPos.z - pos.z
-    return Math.atan2(-dx, -dz) + this.currentYawBias
+  private _snapToNinjaDiagonal (yaw: number): number {
+    const D = Math.PI / 4
+    const DIAGONALS = [D, 3 * D, 5 * D, 7 * D]
+    const wrapped = wrapRadians(yaw)
+    let best = DIAGONALS[0]
+    let bestDist = Math.abs(shortestYawDelta(wrapped, best))
+    for (let i = 1; i < DIAGONALS.length; i++) {
+      const dist = Math.abs(shortestYawDelta(wrapped, DIAGONALS[i]))
+      if (dist < bestDist) { bestDist = dist; best = DIAGONALS[i] }
+    }
+    return best
   }
 
-  private _nextEagleThreshold (): number {
-    const [min, max] = this.config.normal.blocksToEagle
-    return min + Math.floor(Math.random() * (max - min + 1))
+  private _ninjaStrafVec (ninjaYaw: number): Vec3 {
+    const w = wrapRadians(ninjaYaw)
+    const z = (w < Math.PI / 2 || w >= 3 * Math.PI / 2) ? 1 : -1
+    return new Vec3(0, 0, z)
   }
 
   private _nextPitch (): number {
-    const baseDeg = this.config.normal.pitch
-    const jitter = this.config.normal.pitchJitter
-    return pitchFromDeg(baseDeg + randFloat(-jitter, jitter))
+    return pitchFromDeg(
+      this.config.normal.pitch +
+      randFloat(-this.config.normal.pitchJitter, this.config.normal.pitchJitter)
+    )
   }
 
   private _nextYawBias (): number {
-    const jitter = this.config.normal.yawJitter
-    return randFloat(-jitter, jitter) * DEG2RAD
+    return randFloat(-this.config.normal.yawJitter, this.config.normal.yawJitter) * DEG2RAD
   }
 }

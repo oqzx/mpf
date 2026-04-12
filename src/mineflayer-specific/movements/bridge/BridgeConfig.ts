@@ -57,8 +57,8 @@ export const DEFAULT_BRIDGE_CONFIG: BridgeConfig = {
   stallTimeoutMs: 400,
 
   rotation: {
-    lerpYaw: [0.35, 0.55],
-    lerpPitch: [0.38, 0.58],
+    lerpYaw: [0.6, 0.75],       // faster snap → less drift/wobble
+    lerpPitch: [0.85, 0.95],    // was [0.6, 0.75] — converges in ~3 ticks so pitch is solid before allowPlace fires
     maxTurnRadPerTick: 0.4
   },
 
@@ -68,8 +68,8 @@ export const DEFAULT_BRIDGE_CONFIG: BridgeConfig = {
     onlyOnGround: true,
     sprint: 'auto',
     pitch: 78,
-    pitchJitter: 2,
-    yawJitter: 3.5,
+    pitchJitter: 0.5,           // was 2 — minimal pitch variation
+    yawJitter: 0.2,             // was 0.8 — minimal yaw variation
     placementPredictorThreshold: 0.5
   },
 
