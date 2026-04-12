@@ -5,6 +5,7 @@ import {
   randFloat,
   randRangeMs,
   dirFromYaw,
+  snapTo8Dirs,
   GodBridgeSideTracker,
   PlacementPredictor,
   DEG2RAD
@@ -68,8 +69,10 @@ export class NormalMode extends BridgeModeBase {
     if (line != null) {
       const corr = ctx.lineTracker.getCorrectionDir(bot, line)
       if (corr.norm() > 0.001) {
-        movX += corr.x * 0.25
-        movZ += corr.z * 0.25
+        // Keep enough lateral correction so movement resolves to true S+A/D input
+        // instead of pure backwards.
+        movX += corr.x * 0.5
+        movZ += corr.z * 0.5
       }
     }
 
@@ -96,13 +99,13 @@ export class NormalMode extends BridgeModeBase {
     this.currentPitch = this._nextPitch()
     this.currentYawBias = this._nextYawBias()
 
-    if (this.placedBlocks > this.blocksToEagleThreshold) {
+    const reachedEagleWindow = this.blocksToEagleThreshold > 0 && this.placedBlocks >= this.blocksToEagleThreshold
+    if (reachedEagleWindow) {
       this.placedBlocks = 0
       this.blocksToEagleThreshold = this._nextEagleThreshold()
+      const sneakDuration = randRangeMs(this.config.globalSneakMs)
+      this.sneakUntilMs = Math.max(this.sneakUntilMs, ctx.nowMs + sneakDuration)
     }
-
-    const sneakDuration = randRangeMs(this.config.globalSneakMs)
-    this.sneakUntilMs = Math.max(this.sneakUntilMs, ctx.nowMs + sneakDuration)
   }
 
   onMoveEnd (): void {
@@ -137,9 +140,18 @@ export class NormalMode extends BridgeModeBase {
 
   private _exitPosYaw (ctx: TickContext): number {
     const pos = this.bot.entity.position
-    const dx = ctx.move.exitPos.x - pos.x
-    const dz = ctx.move.exitPos.z - pos.z
-    return Math.atan2(-dx, -dz) + this.currentYawBias
+    const toExitX = ctx.move.exitPos.x - pos.x
+    const toExitZ = ctx.move.exitPos.z - pos.z
+    const dist = Math.sqrt(toExitX * toExitX + toExitZ * toExitZ)
+
+    const segX = ctx.move.exitPos.x - ctx.move.entryPos.x
+    const segZ = ctx.move.exitPos.z - ctx.move.entryPos.z
+
+    const baseYaw = dist > 0.08
+      ? Math.atan2(-toExitX, -toExitZ)
+      : Math.atan2(-segX, -segZ)
+
+    return snapTo8Dirs(baseYaw) + this.currentYawBias
   }
 
   private _nextEagleThreshold (): number {

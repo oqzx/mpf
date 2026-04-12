@@ -69,7 +69,7 @@ export const DEFAULT_BRIDGE_CONFIG: BridgeConfig = {
     sprint: 'auto',
     pitch: 78,
     pitchJitter: 2,
-    yawJitter: 3.5,
+    yawJitter: 0.8,
     placementPredictorThreshold: 0.5
   },
 
