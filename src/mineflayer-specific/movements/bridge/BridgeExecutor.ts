@@ -72,7 +72,6 @@ export class BridgeExecutor extends MovementExecutor {
   override async align (thisMove: Move, tickCount: number, goal: goals.Goal): Promise<boolean> {
     const pos = this.bot.entity.position
     const aligned = this.isInitAligned(thisMove, thisMove.entryPos.floored().offset(0.5, 0, 0.5))
-    console.log(`[dbg align] tick=${tickCount} onGround=${this.bot.entity.onGround} pos=(${pos.x.toFixed(2)},${pos.y.toFixed(2)},${pos.z.toFixed(2)}) entryPos=(${thisMove.entryPos.x.toFixed(2)},${thisMove.entryPos.y.toFixed(2)},${thisMove.entryPos.z.toFixed(2)}) exitPos=(${thisMove.exitPos.x.toFixed(2)},${thisMove.exitPos.y.toFixed(2)},${thisMove.exitPos.z.toFixed(2)}) aligned=${aligned}`)
 
     if (this._isInWater()) {
       await super.align(thisMove, tickCount, goal)
@@ -123,8 +122,6 @@ export class BridgeExecutor extends MovementExecutor {
     const pos = bot.entity.position
     const now = Date.now()
 
-    console.log(`[dbg ppt] tick=${tickCount} onGround=${bot.entity.onGround} pos=(${pos.x.toFixed(2)},${pos.y.toFixed(2)},${pos.z.toFixed(2)}) entryY=${thisMove.entryPos.y.toFixed(2)} exitPos=(${thisMove.exitPos.x.toFixed(2)},${thisMove.exitPos.y.toFixed(2)},${thisMove.exitPos.z.toFixed(2)}) stall=${this.stallStartMs > 0 ? now - this.stallStartMs : 0}ms placed=${this.placedThisMove}`)
-
     if (this._isInWater()) {
       if (pos.y < thisMove.exitPos.y) bot.setControlState('jump', true)
       void this.postInitAlignToPath(thisMove)
@@ -136,7 +133,6 @@ export class BridgeExecutor extends MovementExecutor {
     }
 
     if (!bot.entity.onGround && pos.y < Math.round(thisMove.entryPos.y) - 1) {
-      console.log(`[dbg ppt] CANCEL: fell off path pos.y=${pos.y} threshold=${Math.round(thisMove.entryPos.y) - 1}`)
       throw new CancelError('BridgeExecutor: fell off path')
     }
 
@@ -145,7 +141,6 @@ export class BridgeExecutor extends MovementExecutor {
     if (!bot.entity.onGround && (collidedH || xzSpeed < 0.01)) {
       if (this.stallStartMs === 0) this.stallStartMs = now
       if (now - this.stallStartMs > this.bridgeConfig.stallTimeoutMs) {
-        console.log(`[dbg ppt] CANCEL: stalled horizontally for ${now - this.stallStartMs}ms collidedH=${collidedH} xzSpeed=${xzSpeed.toFixed(4)}`)
         throw new CancelError('BridgeExecutor: stalled horizontally')
       }
     } else {
@@ -157,10 +152,8 @@ export class BridgeExecutor extends MovementExecutor {
 
     this._applyRotation(thisMove, modeResult.targetYaw, modeResult.targetPitch)
 
-    console.log(`[dbg ppt] allowPlace=${modeResult.allowPlace} cooldown=${Math.max(0, this.placementCooldownUntilMs - now)}ms targetYaw=${modeResult.targetYaw?.toFixed(3) ?? 'null'} targetPitch=${modeResult.targetPitch?.toFixed(3) ?? 'null'}`)
     if (modeResult.allowPlace && now >= this.placementCooldownUntilMs) {
       const placed = await this._attemptPlacement(path, currentIndex)
-      console.log(`[dbg ppt] _attemptPlacement returned ${placed}`)
       if (placed) {
         this.placedThisMove++
         this.placementCooldownUntilMs = now + this.nextPlacementDelayMs
@@ -180,7 +173,6 @@ export class BridgeExecutor extends MovementExecutor {
 
     const targetMove = path[this.splicedEndIndex] ?? thisMove
     const execComplete = this._isExecutionComplete(thisMove, targetMove, path, currentIndex)
-    console.log(`[dbg ppt] execComplete=${execComplete} splicedEnd=${this.splicedEndIndex} idx=${currentIndex}`)
     if (execComplete) {
       const delta = this.splicedEndIndex - currentIndex
       this.mode.onMoveEnd()
@@ -384,10 +376,11 @@ export class BridgeExecutor extends MovementExecutor {
     const fwdDot = -sinYaw * vec.x - cosYaw * vec.z
     const rightDot = -cosYaw * vec.x + sinYaw * vec.z
 
-    bot.setControlState('forward', fwdDot > 0.3)
-    bot.setControlState('back', fwdDot < -0.3)
-    bot.setControlState('right', rightDot > 0.3)
-    bot.setControlState('left', rightDot < -0.3)
+    // Lower thresholds keep diagonal S+A/D inputs active for speed/ninja-bridge patterns.
+    bot.setControlState('forward', fwdDot > 0.2)
+    bot.setControlState('back', fwdDot < -0.2)
+    bot.setControlState('right', rightDot > 0.15)
+    bot.setControlState('left', rightDot < -0.15)
   }
 
   private _makeCtx (
