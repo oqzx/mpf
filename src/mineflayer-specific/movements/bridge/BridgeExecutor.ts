@@ -1,0 +1,419 @@
+import { Bot } from 'mineflayer'
+import { Vec3 } from 'vec3'
+import { Move } from '../../move'
+import { World } from '../../world/worldInterface'
+import { MovementExecutor } from '../movementExecutor'
+import { MovementOptions } from '../movement'
+import { BreakHandler, PlaceHandler } from '../interactionUtils'
+import { BlockInfo } from '../../world/cacheWorld'
+import { CancelError } from '../../exceptions'
+import * as goals from '../../goals'
+import { randFloat, randRangeMs, shortestYawDelta, OptimalLineTracker } from './BridgeUtils'
+import { BridgeConfig, DEFAULT_BRIDGE_CONFIG } from './BridgeConfig'
+import { BridgeModeBase, TickContext } from './modes/BridgeModeBase'
+import { NormalMode } from './modes/NormalMode'
+import { GodBridgeMode } from './modes/GodBridgeMode'
+import { BreezilyMode } from './modes/BreezilyMode'
+import { PathSplicer } from './PathSplicer'
+import { BuildableMoveExecutor } from '../'
+
+export class BridgeExecutor extends MovementExecutor {
+  private static readonly MIN_YAW_DELTA_RAD = 0.0003
+
+  private readonly bridgeConfig: BridgeConfig
+  private readonly mode: BridgeModeBase
+  private readonly lineTracker = new OptimalLineTracker()
+
+  private placedThisMove = 0
+  private placementCooldownUntilMs = 0
+  private nextPlacementDelayMs = 0
+
+  private elevated = false
+  private elevatedJumpCooldownUntilMs = 0
+
+  private splicedEndIndex = 0
+  private stallStartMs = 0
+
+  private _lerpYaw = 0.4
+  private _lerpPitch = 0.45
+
+  constructor (bot: Bot, world: World, settings: Partial<MovementOptions> = {}, cfg: Partial<BridgeConfig> = {}) {
+    super(bot, world, settings)
+
+    this.bridgeConfig = {
+      ...DEFAULT_BRIDGE_CONFIG,
+      ...cfg,
+      rotation: { ...DEFAULT_BRIDGE_CONFIG.rotation, ...cfg.rotation },
+      normal: { ...DEFAULT_BRIDGE_CONFIG.normal, ...cfg.normal },
+      godbridge: { ...DEFAULT_BRIDGE_CONFIG.godbridge, ...cfg.godbridge },
+      breezily: { ...DEFAULT_BRIDGE_CONFIG.breezily, ...cfg.breezily }
+    }
+
+    switch (this.bridgeConfig.mode) {
+      case 'godbridge':
+        this.mode = new GodBridgeMode(bot, world, this.bridgeConfig)
+        break
+      case 'breezily':
+        this.mode = new BreezilyMode(bot, world, this.bridgeConfig)
+        break
+      default:
+        this.mode = new NormalMode(bot, world, this.bridgeConfig)
+    }
+  }
+
+  static withConfig (cfg: Partial<BridgeConfig> = {}): BuildableMoveExecutor {
+    return class BridgeExecutorConfigured extends BridgeExecutor {
+      constructor (bot: Bot, world: World, settings: Partial<MovementOptions>) {
+        super(bot, world, settings, cfg)
+      }
+    }
+  }
+
+  override async align (thisMove: Move, tickCount: number, goal: goals.Goal): Promise<boolean> {
+    const pos = this.bot.entity.position
+    const aligned = this.isInitAligned(thisMove, thisMove.entryPos.floored().offset(0.5, 0, 0.5))
+    console.log(`[dbg align] tick=${tickCount} onGround=${this.bot.entity.onGround} pos=(${pos.x.toFixed(2)},${pos.y.toFixed(2)},${pos.z.toFixed(2)}) entryPos=(${thisMove.entryPos.x.toFixed(2)},${thisMove.entryPos.y.toFixed(2)},${thisMove.entryPos.z.toFixed(2)}) exitPos=(${thisMove.exitPos.x.toFixed(2)},${thisMove.exitPos.y.toFixed(2)},${thisMove.exitPos.z.toFixed(2)}) aligned=${aligned}`)
+
+    if (this._isInWater()) {
+      await super.align(thisMove, tickCount, goal)
+      this.bot.setControlState('jump', pos.y < thisMove.entryPos.y)
+      return this.isInitAligned(thisMove, thisMove.entryPos.floored().offset(0.5, 0, 0.5))
+    }
+
+    if (!this.bot.entity.onGround && pos.y > thisMove.entryPos.y + 0.1) return false
+
+    // Must drive movement, not just look — otherwise the bot freezes after execComplete
+    // postInitAlignToPath handles looking at exitPos AND setting forward/back controls
+    void this.postInitAlignToPath(thisMove)
+    return aligned
+  }
+
+  async performInit (thisMove: Move, currentIndex: number, path: Move[]): Promise<void> {
+    this.bot.clearControlStates()
+
+    this.placedThisMove = 0
+    this.placementCooldownUntilMs = 0
+    this.stallStartMs = 0
+    this.nextPlacementDelayMs = randRangeMs(this.bridgeConfig.placementDelayMs)
+    this._refreshLerp()
+    this.lineTracker.reset()
+
+    if (this._isInWater()) {
+      await this.postInitAlignToPath(thisMove)
+      return
+    }
+
+    this.elevated = this._shouldElevate()
+    this.elevatedJumpCooldownUntilMs = 0
+    this.splicedEndIndex = PathSplicer.computeSpliceEnd(this.bot, this.world, currentIndex, path)
+
+    const ctx = this._makeCtx(thisMove, currentIndex, path)
+    this.mode.onMoveStart(ctx)
+
+    await this.lookAtPathPos(thisMove.exitPos)
+  }
+
+  async performPerTick (
+    thisMove: Move,
+    tickCount: number,
+    currentIndex: number,
+    path: Move[]
+  ): Promise<boolean | number> {
+    const bot = this.bot
+    const pos = bot.entity.position
+    const now = Date.now()
+
+    console.log(`[dbg ppt] tick=${tickCount} onGround=${bot.entity.onGround} pos=(${pos.x.toFixed(2)},${pos.y.toFixed(2)},${pos.z.toFixed(2)}) entryY=${thisMove.entryPos.y.toFixed(2)} exitPos=(${thisMove.exitPos.x.toFixed(2)},${thisMove.exitPos.y.toFixed(2)},${thisMove.exitPos.z.toFixed(2)}) stall=${this.stallStartMs > 0 ? now - this.stallStartMs : 0}ms placed=${this.placedThisMove}`)
+
+    if (this._isInWater()) {
+      if (pos.y < thisMove.exitPos.y) bot.setControlState('jump', true)
+      void this.postInitAlignToPath(thisMove)
+      if (this.isComplete(thisMove)) {
+        this.mode.onMoveEnd()
+        return true
+      }
+      return false
+    }
+
+    if (!bot.entity.onGround && pos.y < Math.round(thisMove.entryPos.y) - 1) {
+      console.log(`[dbg ppt] CANCEL: fell off path pos.y=${pos.y} threshold=${Math.round(thisMove.entryPos.y) - 1}`)
+      throw new CancelError('BridgeExecutor: fell off path')
+    }
+
+    const xzSpeed = Math.sqrt(bot.entity.velocity.x ** 2 + bot.entity.velocity.z ** 2)
+    const collidedH = (bot.entity as any).isCollidedHorizontally as boolean
+    if (!bot.entity.onGround && (collidedH || xzSpeed < 0.01)) {
+      if (this.stallStartMs === 0) this.stallStartMs = now
+      if (now - this.stallStartMs > this.bridgeConfig.stallTimeoutMs) {
+        console.log(`[dbg ppt] CANCEL: stalled horizontally for ${now - this.stallStartMs}ms collidedH=${collidedH} xzSpeed=${xzSpeed.toFixed(4)}`)
+        throw new CancelError('BridgeExecutor: stalled horizontally')
+      }
+    } else {
+      this.stallStartMs = 0
+    }
+
+    const ctx = this._makeCtx(thisMove, currentIndex, path)
+    const modeResult = this.mode.onTick(ctx)
+
+    this._applyRotation(thisMove, modeResult.targetYaw, modeResult.targetPitch)
+
+    console.log(`[dbg ppt] allowPlace=${modeResult.allowPlace} cooldown=${Math.max(0, this.placementCooldownUntilMs - now)}ms targetYaw=${modeResult.targetYaw?.toFixed(3) ?? 'null'} targetPitch=${modeResult.targetPitch?.toFixed(3) ?? 'null'}`)
+    if (modeResult.allowPlace && now >= this.placementCooldownUntilMs) {
+      const placed = await this._attemptPlacement(path, currentIndex)
+      console.log(`[dbg ppt] _attemptPlacement returned ${placed}`)
+      if (placed) {
+        this.placedThisMove++
+        this.placementCooldownUntilMs = now + this.nextPlacementDelayMs
+        this.nextPlacementDelayMs = randRangeMs(this.bridgeConfig.placementDelayMs)
+        const updatedCtx = this._makeCtx(thisMove, currentIndex, path)
+        this.mode.onBlockPlaced(updatedCtx)
+        this._refreshLerp()
+        this.lineTracker.trackPlacement(
+          new Vec3(thisMove.x, thisMove.y - 1, thisMove.z)
+        )
+      }
+    }
+
+    await this._attemptBreak(thisMove)
+
+    this._applyMovement(thisMove, modeResult, now)
+
+    const targetMove = path[this.splicedEndIndex] ?? thisMove
+    const execComplete = this._isExecutionComplete(thisMove, targetMove, path, currentIndex)
+    console.log(`[dbg ppt] execComplete=${execComplete} splicedEnd=${this.splicedEndIndex} idx=${currentIndex}`)
+    if (execComplete) {
+      const delta = this.splicedEndIndex - currentIndex
+      this.mode.onMoveEnd()
+      return delta > 0 ? delta : true
+    }
+
+    return false
+  }
+
+  private _refreshLerp (): void {
+    const [minY, maxY] = this.bridgeConfig.rotation.lerpYaw
+    const [minP, maxP] = this.bridgeConfig.rotation.lerpPitch
+    this._lerpYaw = randFloat(minY, maxY)
+    this._lerpPitch = randFloat(minP, maxP)
+  }
+
+  private _isExecutionComplete (
+    thisMove: Move,
+    targetMove: Move,
+    path: Move[],
+    currentIndex: number
+  ): boolean {
+    if (this.toBreakLen() > 0) return false
+
+    for (let i = currentIndex; i <= this.splicedEndIndex; i++) {
+      const m = path[i]
+      if (m == null) break
+      for (const place of m.toPlace) {
+        if (!place.done) return false
+      }
+    }
+
+    return this.isComplete(thisMove, targetMove)
+  }
+
+  private _isInWater (): boolean {
+    if ((this.bot.entity as any).isInWater as boolean) return true
+    if (this.bot.entity.onGround) return false
+    return this.getBlockInfo(this.bot.entity.position, 0, -0.6, 0).liquid
+  }
+
+  private _shouldElevate (): boolean {
+    const goal = this.bot.pathfinder?.goal
+    if (goal == null) return false
+
+    const x = (goal as any).x ?? (goal as any).entity?.position?.x
+    const z = (goal as any).z ?? (goal as any).entity?.position?.z
+    if (x == null || z == null) return false
+
+    const pos = this.bot.entity.position
+    const xzDist = Math.sqrt((pos.x - x) ** 2 + (pos.z - z) ** 2)
+    if (xzDist <= this.bridgeConfig.elevatedBridgeThreshold) return false
+
+    // Only elevate-jump if the goal is meaningfully higher than current position.
+    // Flat bridges should never jump – jumping breaks placement timing.
+    const goalY = (goal as any).y ?? (goal as any).entity?.position?.y
+    if (goalY == null) return false
+    return goalY - pos.y > 1
+  }
+
+  private _applyRotation (
+    move: Move,
+    targetYaw: number | null,
+    targetPitch: number | null
+  ): void {
+    const yaw = targetYaw ?? this._defaultYaw(move)
+    const pitch = targetPitch ?? this._defaultPitch()
+
+    const currentYaw = this.bot.entity.yaw
+    const currentPitch = this.bot.entity.pitch
+
+    let dyaw = shortestYawDelta(currentYaw, yaw)
+
+    const maxTurn = this.bridgeConfig.rotation.maxTurnRadPerTick
+    if (Math.abs(dyaw) > maxTurn) {
+      dyaw = Math.sign(dyaw) * maxTurn
+    }
+
+    const rawStep = dyaw * this._lerpYaw
+    const step = Math.abs(rawStep) < BridgeExecutor.MIN_YAW_DELTA_RAD
+      ? Math.sign(rawStep !== 0 ? rawStep : 1) * BridgeExecutor.MIN_YAW_DELTA_RAD
+      : rawStep
+
+    this.bot.entity.yaw = currentYaw + step + randFloat(-0.005, 0.005)
+    this.bot.entity.pitch = currentPitch + (pitch - currentPitch) * this._lerpPitch
+  }
+
+  private _defaultYaw (move: Move): number {
+    const pos = this.bot.entity.position
+    return Math.atan2(-(move.exitPos.x - pos.x), -(move.exitPos.z - pos.z))
+  }
+
+  private _defaultPitch (): number {
+    return -(70 * (Math.PI / 180))
+  }
+
+  private async _attemptPlacement (path: Move[], startIndex: number): Promise<boolean> {
+    for (let i = startIndex; i <= this.splicedEndIndex; i++) {
+      const m = path[i]
+      if (m == null) break
+
+      for (const place of m.toPlace) {
+        if (place.done) continue
+        if (place.isPerforming) continue
+        if (!(place instanceof PlaceHandler)) continue
+        if (!place.needToPerform(this.bot)) continue
+
+        const item = place.getItem(this.bot)
+        if (item == null) continue
+
+        void place._perform(this.bot, item, {}).catch(() => {})
+        return true
+      }
+    }
+    return false
+  }
+
+  private async _attemptBreak (move: Move): Promise<void> {
+    for (const breakHandler of move.toBreak) {
+      if (breakHandler.done) continue
+      if (breakHandler.isPerforming) continue
+      if (!(breakHandler instanceof BreakHandler)) continue
+      if (!breakHandler.needToPerform(this.bot)) continue
+
+      const block = breakHandler.getBlock(this.world)
+      const item = block != null ? breakHandler.getItem(this.bot, block) : null
+
+      void breakHandler._perform(this.bot, item, {}).catch(() => {})
+      return
+    }
+  }
+
+  private _applyMovement (
+    move: Move,
+    modeResult: { wantSneak: boolean, wantJump: boolean, movementOverride: Vec3 | null },
+    nowMs: number
+  ): void {
+    const bot = this.bot
+
+    const needsElevatedJump = this.elevated &&
+      nowMs >= this.elevatedJumpCooldownUntilMs &&
+      bot.entity.onGround
+
+    const finalJump = modeResult.wantJump || needsElevatedJump
+    const finalSneak = modeResult.wantSneak && !finalJump
+
+    if (needsElevatedJump) {
+      this.elevatedJumpCooldownUntilMs = nowMs + randFloat(400, 550)
+    }
+
+    bot.setControlState('sneak', finalSneak)
+    bot.setControlState('jump', finalJump)
+
+    if (modeResult.movementOverride != null) {
+      const ov = modeResult.movementOverride
+      if (ov.norm() < 0.01) {
+        bot.setControlState('forward', false)
+        bot.setControlState('back', false)
+        bot.setControlState('left', false)
+        bot.setControlState('right', false)
+        bot.setControlState('sprint', false)
+      } else {
+        this._applyDirectionalVector(ov)
+        this._applySprintState(finalSneak)
+      }
+    } else {
+      void this.postInitAlignToPath(move, { sprint: !finalSneak })
+      if (this.bridgeConfig.mode !== 'normal') {
+        bot.setControlState('sprint', !finalSneak)
+      }
+    }
+  }
+
+  private _applySprintState (finalSneak: boolean): void {
+    const bot = this.bot
+    const cfg = this.bridgeConfig
+
+    if (cfg.mode !== 'normal') {
+      bot.setControlState('sprint', !finalSneak)
+      return
+    }
+
+    const sprintMode = cfg.normal.sprint
+    if (sprintMode === 'always') {
+      bot.setControlState('sprint', !finalSneak)
+    } else if (sprintMode === 'auto') {
+      const vel = bot.entity.velocity
+      const xzSpeed = Math.sqrt(vel.x * vel.x + vel.z * vel.z)
+      bot.setControlState('sprint', !finalSneak && xzSpeed > 0.08)
+    } else {
+      bot.setControlState('sprint', false)
+    }
+  }
+
+  private _applyDirectionalVector (vec: Vec3): void {
+    const bot = this.bot
+    const yaw = bot.entity.yaw
+    const cosYaw = Math.cos(yaw)
+    const sinYaw = Math.sin(yaw)
+
+    const fwdDot = -sinYaw * vec.x - cosYaw * vec.z
+    const rightDot = -cosYaw * vec.x + sinYaw * vec.z
+
+    bot.setControlState('forward', fwdDot > 0.3)
+    bot.setControlState('back', fwdDot < -0.3)
+    bot.setControlState('right', rightDot > 0.3)
+    bot.setControlState('left', rightDot < -0.3)
+  }
+
+  private _makeCtx (
+    move: Move,
+    currentIndex: number,
+    path: Move[]
+  ): TickContext {
+    return {
+      move,
+      nowMs: Date.now(),
+      path,
+      pathIndex: currentIndex,
+      lineTracker: this.lineTracker,
+      placedThisMove: this.placedThisMove,
+      totalBlockCount: this._countBlocks()
+    }
+  }
+
+  private _countBlocks (): number {
+    let count = 0
+    for (let i = 0; i < 9; i++) {
+      const slot = this.bot.inventory.slots[36 + i]
+      if (slot != null && slot.count > 0 && BlockInfo.scaffoldingBlockItems.has(slot.type)) {
+        count += slot.count
+      }
+    }
+    return count
+  }
+}
