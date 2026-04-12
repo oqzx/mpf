@@ -139,19 +139,9 @@ export class NormalMode extends BridgeModeBase {
   }
 
   private _exitPosYaw (ctx: TickContext): number {
-    const pos = this.bot.entity.position
-    const toExitX = ctx.move.exitPos.x - pos.x
-    const toExitZ = ctx.move.exitPos.z - pos.z
-    const dist = Math.sqrt(toExitX * toExitX + toExitZ * toExitZ)
-
-    const segX = ctx.move.exitPos.x - ctx.move.entryPos.x
-    const segZ = ctx.move.exitPos.z - ctx.move.entryPos.z
-
-    const baseYaw = dist > 0.08
-      ? Math.atan2(-toExitX, -toExitZ)
-      : Math.atan2(-segX, -segZ)
-
-    return snapTo8Dirs(baseYaw) + this.currentYawBias
+    const dx = ctx.move.exitPos.x - ctx.move.entryPos.x
+    const dz = ctx.move.exitPos.z - ctx.move.entryPos.z
+    return Math.atan2(-dx, -dz) + this.currentYawBias
   }
 
   private _nextEagleThreshold (): number {
