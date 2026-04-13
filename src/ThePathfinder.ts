@@ -728,7 +728,7 @@ export class ThePathfinder {
   private async _runExecutorStep<T> (
   label: string,
   fn: () => Promise<T>,
-  maxTickAdvance = 1
+  maxTickAdvance = 0
 ): Promise<{ result: T, ticksAdvanced: number }> {
   const startAge = this.tickAge;
   const result = await fn()
@@ -780,19 +780,19 @@ async perform (path: Path | OptPath, goal: goals.Goal, entry = 0): Promise<void>
       continue
     }
 
-    // console.log('performing', move.moveType.constructor.name, 'at index', currentIndex + 1, 'of', path.path.length)
-    // console.log(
-    //   'toPlace',
-    //   move.toPlace.map((p) => p.vec),
-    //   'toBreak',
-    //   move.toBreak.map((b) => b.vec),
-    //   'entryPos asVec',
-    //   move.parent?.vec ?? "none",
-    //   'exitPos asVec',
-    //   move.vec,
-    //   'entryPos',
-    //   move.entryPos,
-    // )
+    console.log('performing', move.moveType.constructor.name, 'at index', currentIndex + 1, 'of', path.path.length)
+    console.log(
+      'toPlace',
+      move.toPlace.map((p) => p.vec),
+      'toBreak',
+      move.toBreak.map((b) => b.vec),
+      'entryPos asVec',
+      move.parent?.vec ?? "none",
+      'exitPos asVec',
+      move.vec,
+      'entryPos',
+      move.entryPos,
+    )
 
     try {
       while (tickCount < 999) {
@@ -800,8 +800,7 @@ async perform (path: Path | OptPath, goal: goals.Goal, entry = 0): Promise<void>
 
         const { result: aligned, ticksAdvanced } = await this._runExecutorStep(
           `${move.moveType.constructor.name}.align`,
-          async () => await executor.align(move, tickCount++, goal),
-          1
+          async () => await executor.align(move, tickCount++, goal)
         )
 
         if (aligned) break
@@ -823,8 +822,7 @@ async perform (path: Path | OptPath, goal: goals.Goal, entry = 0): Promise<void>
 
         const step = await this._runExecutorStep(
           `${move.moveType.constructor.name}._performPerTick`,
-          async () => await executor._performPerTick(move, tickCount++, currentIndex, path.path),
-          1
+          async () => await executor._performPerTick(move, tickCount++, currentIndex, path.path)
         )
 
         adding = step.result
@@ -887,7 +885,7 @@ async perform (path: Path | OptPath, goal: goals.Goal, entry = 0): Promise<void>
       nextMove = path.path[ind + 1]
     }
 
-    const no = entry > 5 || bad
+    const no = true; //entry > 5 || bad
     if (no || nextMove == null) {
       newGoal = goal
     } else {

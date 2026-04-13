@@ -265,16 +265,17 @@ export abstract class MovementExecutor extends Movement {
     const xzVelDir = xzVel.normalize()
 
     const dist = offset.norm()
-    const similarDirection = offset.normalize().dot(dir.normalize()) > 0.5
 
     const ectx = EPhysicsCtx.FROM_BOT(this.bot.physicsUtil.engine, this.bot)
+    const history= [ectx.position.clone()];
     for (let i = 0; i < ticks; i++) {
+      ectx.state.control.set('jump', false) // we don't want to jump again.
+      ectx.state.jumpQueued = false;
       this.bot.physicsUtil.engine.simulate(ectx, this.world)
+      history.push(ectx.position.clone())
     }
 
     const pos = ectx.state.pos.clone()
-
-    this.bot.physicsUtil.engine.simulate(ectx, this.world) // needed for later.
 
     // console.log(ectx.state.pos, ectx.state.isCollidedHorizontally, ectx.state.isCollidedVertically);
 
@@ -293,6 +294,8 @@ export abstract class MovementExecutor extends Movement {
       !ectx.state.isInWater &&
       !ectx.state.onGround &&
       this.bot.pathfinder.world.getBlockInfo(this.bot.entity.position.floored().translate(0, -0.6, 0)).liquid
+
+
     if (aboveWater) {
       bb1bl = this.bot.pathfinder.world.getBlockInfo(target.floored())
       bbCheckCond = bb1bl.walkthrough
@@ -316,13 +319,16 @@ export abstract class MovementExecutor extends Movement {
       //   bb1s,
       //   bb0,
       //   bbCheckCond,
-      //   bb1s.some((b) => b.collides(bb0))
+      //   bb1s.some((b) => b.collides(bb0)),
+      //   pos.y >= bb1bl.height,
+      //   history
       // );
     }
     // const bbOff = new Vec3(0, ectx.state.isInWater ? 0 : -1, 0)
 
     const headingThatWay = xzVelDir.dot(dir.normalize()) > -2
-
+    const similarDirection = offset.normalize().dot(dir.normalize()) > 0.5
+    
     // console.log(endMove.exitPos.floored().translate(0, -1, 0), bb1physical)
     // startMove.moveType.getBlockInfo(endMove.exitPos.floored(), 0, -1, 0).physical;
 
@@ -330,9 +336,12 @@ export abstract class MovementExecutor extends Movement {
     // console.log(weGood, similarDirection, offset.y <= 0, this.bot.entity.position);
     // console.info('end move exit pos', endMove.exitPos.toString())
     if (weGood) {
-      // console.log(offset.normalize().dot(dir.normalize()), similarDirection, headingThatWay, ectx.state.isCollidedHorizontally, ectx.state.isCollidedVertically)
-      if (similarDirection && headingThatWay) return !ectx.state.isCollidedHorizontally
+      // console.log('we good checl', xzVelDir.normalize().dot(dir.normalize()), offset, headingThatWay,  similarDirection,  ectx.state.isCollidedHorizontally, ectx.state.isCollidedVertically)
+      if (similarDirection && headingThatWay) return !ectx.state.isCollidedHorizontally // in air check.
       else if (dist < 0.2) return true
+      else {
+        return true;
+      }
 
       // console.log('finished!', this.bot.entity.position, endMove.exitPos, bbsVertTouching, similarDirection, headingThatWay, offset.y)
     }
