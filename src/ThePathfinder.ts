@@ -131,6 +131,7 @@ export class ThePathfinder {
   pathfinderSettings: PathfinderOptions
 
   private readonly currentIndex = 0
+  private tickAge = 0;
   private executeTask: Task<void, void> = Task.createDoneTask()
   private wantedGoal?: goals.Goal
   public abortCalculation = false
@@ -192,6 +193,10 @@ export class ThePathfinder {
     this.astar = null
 
     this.setupListeners()
+
+    this.bot.on("physicsTick", () => {
+      this.tickAge++;
+    })
   }
 
   get goal (): goals.Goal | undefined {
@@ -719,6 +724,27 @@ export class ThePathfinder {
     }
   }
 
+
+  private async _runExecutorStep<T> (
+  label: string,
+  fn: () => Promise<T>,
+  maxTickAdvance = 1
+): Promise<{ result: T, ticksAdvanced: number }> {
+  const startAge = this.tickAge;
+  const result = await fn()
+  const endAge = this.tickAge;
+
+  const ticksAdvanced = endAge - startAge
+  if (ticksAdvanced > maxTickAdvance) {
+    throw new Error(
+      `[perform] ${label} advanced too many physics ticks: ` +
+      `startAge=${startAge}, endAge=${endAge}, ticksAdvanced=${ticksAdvanced}`
+    )
+  }
+
+  return { result, ticksAdvanced }
+}
+
   /**
    * Do not mind the absolutely horrendous code here right now.
    * It will be fixed, just very busy right now.
@@ -726,102 +752,118 @@ export class ThePathfinder {
    * @param goal
    * @param entry
    */
-  async perform (path: Path | OptPath, goal: goals.Goal, entry = 0): Promise<void> {
-    if (entry > 10) throw new Error('Too many failures, exiting performing.')
+async perform (path: Path | OptPath, goal: goals.Goal, entry = 0): Promise<void> {
+  if (entry > 10) throw new Error('Too many failures, exiting performing.')
 
-    // console.log('ENTER PERFORM')
-    let currentIndex = 0
-    const movementHandler = path.context.movementProvider as MovementHandler
-    const movements = movementHandler.getMovements()
+  let currentIndex = 0
+  const movementHandler = path.context.movementProvider as MovementHandler
+  const movements = movementHandler.getMovements()
 
-    const pathEx = Object.hasOwnProperty.call(path, 'optPath') ? (path as OptPath).optPath : path.path
+  const pathEx = Object.hasOwnProperty.call(path, 'optPath') ? (path as OptPath).optPath : path.path
 
-    while (currentIndex < pathEx.length) {
-      const move = pathEx[currentIndex]
-      const executor = movements.get(move.moveType.constructor as BuildableMoveProvider)
-      if (executor == null) throw new Error('No executor for movement type ' + move.moveType.constructor.name)
+  while (currentIndex < pathEx.length) {
+    const move = pathEx[currentIndex]
+    const executor = movements.get(move.moveType.constructor as BuildableMoveProvider)
+    if (executor == null) throw new Error('No executor for movement type ' + move.moveType.constructor.name)
 
-      this.curPath = pathEx
-      this.currentMove = move
-      this.currentExecutor = executor
+    this.curPath = pathEx
+    this.currentMove = move
+    this.currentExecutor = executor
 
-      let tickCount = 0
-
-      // TODO: could move this to physicsTick to be performant, but meh who cares.
-
-      // reset bot.
-      await this.cleanupBot()
-
-      // provide current move to executor as a reference.
-      executor.loadMove(move)
-
-      // if the movement has already been completed (another movement has already completed it), skip it.
-      if (executor.isAlreadyCompleted(move, tickCount, goal)) {
-        // console.log('skipping', move.moveType.constructor.name, 'at index', currentIndex + 1, 'of', path.path.length)
-
-        currentIndex++
-        continue
-      }
-
-      console.log('performing', move.moveType.constructor.name, 'at index', currentIndex + 1, 'of', path.path.length)
-      console.log(
-        'toPlace',
-        move.toPlace.map((p) => p.vec),
-        'toBreak',
-        move.toBreak.map((b) => b.vec),
-        'entryPos',
-        move.entryPos,
-        'asVec',
-        move.vec,
-        'exitPos',
-        move.exitPos
-      )
-
-      // wrap this code in a try-catch as we intentionally throw errors.
-      try {
-        while (!(await executor.align(move, tickCount++, goal)) && tickCount < 999) {
-          this.check()
-          await this.bot.waitForTicks(1)
-        }
-
-        tickCount = 0
-
-        // allow the initial execution of this code.
-        await executor._performInit(move, currentIndex, path.path)
-
-        this.check()
-        let adding = await executor._performPerTick(move, tickCount++, currentIndex, path.path)
-
-        while (!(adding as boolean) && tickCount < 999) {
-          this.check()
-          await this.bot.waitForTicks(1)
-          adding = await executor._performPerTick(move, tickCount++, currentIndex, path.path)
-        }
-
-        currentIndex += adding as number
-        // console.log('done with move', move.exitPos, this.bot.entity.position, this.bot.entity.position.distanceTo(move.exitPos))
-      } catch (err) {
-        // immediately exit since we want to abort the entire path.
-        if (err instanceof AbortError) {
-          executor.reset()
-          // await this.cleanupBot()
-          delete this.resetReason
-          break
-        } else if (err instanceof ResetError) {
-          executor.reset()
-          // await this.cleanupBot()
-          break
-        } else if (err instanceof CancelError) {
-          console.log(`[dbg perform] CancelError on move idx=${currentIndex} entryPos=(${move.entryPos.x.toFixed(2)},${move.entryPos.y.toFixed(2)},${move.entryPos.z.toFixed(2)}) exitPos=(${move.exitPos.x.toFixed(2)},${move.exitPos.y.toFixed(2)},${move.exitPos.z.toFixed(2)}) msg=${(err as Error).message}`)
-          await this.recovery(move, path, goal, entry)
-          break
-        } else throw err
-      }
-    }
+    let tickCount = 0
 
     await this.cleanupBot()
-    // console.log('FINISHED PERFORM')
+    executor.loadMove(move)
+
+    if (executor.isAlreadyCompleted(move, tickCount, goal)) {
+      currentIndex++
+      continue
+    }
+
+    // console.log('performing', move.moveType.constructor.name, 'at index', currentIndex + 1, 'of', path.path.length)
+    // console.log(
+    //   'toPlace',
+    //   move.toPlace.map((p) => p.vec),
+    //   'toBreak',
+    //   move.toBreak.map((b) => b.vec),
+    //   'entryPos asVec',
+    //   move.parent?.vec ?? "none",
+    //   'exitPos asVec',
+    //   move.vec,
+    //   'entryPos',
+    //   move.entryPos,
+    // )
+
+    try {
+      while (tickCount < 999) {
+        this.check()
+
+        const { result: aligned, ticksAdvanced } = await this._runExecutorStep(
+          `${move.moveType.constructor.name}.align`,
+          async () => await executor.align(move, tickCount++, goal),
+          1
+        )
+
+        if (aligned) break
+
+        if (ticksAdvanced === 0) {
+          await this.bot.waitForTicks(1)
+        }
+      }
+
+      tickCount = 0
+
+      await executor._performInit(move, currentIndex, path.path)
+
+      this.check()
+
+      let adding: boolean | number
+      while (true) {
+        this.check()
+
+        const step = await this._runExecutorStep(
+          `${move.moveType.constructor.name}._performPerTick`,
+          async () => await executor._performPerTick(move, tickCount++, currentIndex, path.path),
+          1
+        )
+
+        adding = step.result
+
+        if (adding as boolean) break
+
+        if (step.ticksAdvanced === 0) {
+          await this.bot.waitForTicks(1)
+        }
+
+        if (tickCount >= 999) break
+      }
+
+      currentIndex += adding as number
+    } catch (err) {
+      if (err instanceof AbortError) {
+        executor.reset()
+        delete this.resetReason
+        break
+      } else if (err instanceof ResetError) {
+        executor.reset()
+        break
+      } else if (err instanceof CancelError) {
+        console.log(
+          `[dbg perform] CancelError on move idx=${currentIndex} ` +
+          `entryPos=(${move.entryPos.x.toFixed(2)},${move.entryPos.y.toFixed(2)},${move.entryPos.z.toFixed(2)}) ` +
+          `exitPos=(${move.exitPos.x.toFixed(2)},${move.exitPos.y.toFixed(2)},${move.exitPos.z.toFixed(2)}) ` +
+          `msg=${(err as Error).message}`
+        )
+        await this.recovery(move, path, goal, entry)
+        break
+      } else {
+        throw err
+      }
+    }
   }
+
+  await this.cleanupBot()
+}
 
   // TODO: implement recovery for any movement and goal.
   async recovery (move: Move, path: Path, goal: goals.Goal, entry = 0): Promise<void> {

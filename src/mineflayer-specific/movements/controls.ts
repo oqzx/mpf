@@ -169,6 +169,7 @@ export function botStrafeMovement (bot: Bot, nextPoint: Vec3): void {
   // console.log('stopping since near goal')
     bot.setControlState('left', false)
     bot.setControlState('right', false)
+    return;
   }
 
   if (FOURTEEN_PI_OVER_TWELVE < diff && diff < TWENTY_TWO_PI_OVER_TWELVE) {
@@ -266,5 +267,80 @@ export function botSmartMovement (bot: Bot, nextPoint: Vec3, sprint: boolean): v
     bot.setControlState('forward', false)
     bot.setControlState('sprint', false)
     bot.setControlState('back', false)
+  }
+}
+
+
+export function botStrafeMovementStrict(bot: Bot, nextPoint: Vec3): void {
+  const pos = bot.entity.position
+  const vel = bot.entity.velocity
+  const yaw = bot.entity.yaw
+
+  const dx = nextPoint.x - pos.x
+  const dz = nextPoint.z - pos.z
+
+  const sin = Math.sin(yaw)
+  const cos = Math.cos(yaw)
+
+  // Local-space errors relative to current look direction
+  const forwardError = -(dx * sin + dz * cos)
+  const sideError = dx * cos - dz * sin
+
+  // Local-space lateral velocity
+  const sideVel = vel.x * cos - vel.z * sin
+
+  const dist = pos.distanceTo(nextPoint)
+  if (dist < 0.1) {
+    bot.setControlState('left', false)
+    bot.setControlState('right', false)
+    return
+  }
+
+  // Only do strict side correction when target is meaningfully in front.
+  // If target is not ahead, let forward/back/yaw logic dominate.
+  if (forwardError <= 0) {
+    bot.setControlState('left', false)
+    bot.setControlState('right', false)
+    return
+  }
+
+  // Tune these
+  const startThresh = bot.entity.onGround ? 0.08 : 0.04
+  const stopThresh = bot.entity.onGround ? 0.03 : 0.02
+
+  // Predictive side error: bias by current lateral drift
+  const predictedSideError = sideError - sideVel * 3.0
+
+  const currentlyLeft = bot.getControlState('left')
+  const currentlyRight = bot.getControlState('right')
+
+  // Hysteresis
+if (currentlyLeft) {
+  if (predictedSideError >= -stopThresh) {
+    bot.setControlState('left', false)
+  }
+  bot.setControlState('right', false)
+  return
+}
+
+if (currentlyRight) {
+  if (predictedSideError <= stopThresh) {
+    bot.setControlState('right', false)
+  }
+  bot.setControlState('left', false)
+  return
+}
+
+  if (predictedSideError > startThresh) {
+    // target is on one side: hold correction
+    bot.setControlState('left', false)
+    bot.setControlState('right', true)
+  } else if (predictedSideError < -startThresh) {
+
+        bot.setControlState('left', true)
+    bot.setControlState('right', false)
+  } else {
+    bot.setControlState('left', false)
+    bot.setControlState('right', false)
   }
 }

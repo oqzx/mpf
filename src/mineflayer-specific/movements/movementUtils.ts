@@ -474,7 +474,7 @@ export class ParkourJumpHelper {
     return reached(state, 0) as boolean
   }
 
-  public simFallOffEdge (goal: Vec3): boolean {
+  public simFallOffEdge (goal: Vec3, target?: Vec3): boolean {
     const goalVert = this.findGoalVertex(AABB.fromBlockPos(goal))
 
     // console.log('sim jump goals', goal, goalVert)
@@ -483,7 +483,7 @@ export class ParkourJumpHelper {
     const goalBBs = this.world.getBlockInfo(goal).getBBs()
 
     ctx.state.control = ControlStateHandler.DEFAULT()
-    stateLookAt(ctx.state, goal)
+    if (target) stateLookAt(ctx.state, target)
     ctx.state.control.set('forward', true)
     ctx.state.control.set('jump', false)
     ctx.state.control.set('sprint', true)

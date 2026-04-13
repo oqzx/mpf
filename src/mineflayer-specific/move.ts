@@ -114,7 +114,7 @@ export class Move implements PathData {
       pos.z,
       toPlace,
       toBreak,
-      prevMove.remainingBlocks - 0, // toPlace.length,
+      prevMove.remainingBlocks - toPlace.length,
       cost,
       type,
       prevMove.exitPos,
