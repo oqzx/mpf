@@ -22,7 +22,10 @@ export class NormalMode extends BridgeModeBase {
   private currentPitch = 0
   private currentYawBias = 0
   private shouldBridge = false
-  private _safeWalkUntilMs = 0
+  /** Single timer drives all sneaking – no per-tick reactive toggling. */
+  private _sneakUntilMs = 0
+  /** Tracks previous overAir state for rising-edge detection. */
+  private _wasOverAir = false
 
   onMoveStart (ctx: TickContext): void {
     this.phase = 'approach'
@@ -30,7 +33,8 @@ export class NormalMode extends BridgeModeBase {
     this.currentPitch = this._nextPitch()
     this.currentYawBias = this._nextYawBias()
     this.shouldBridge = false
-    this._safeWalkUntilMs = 0
+    this._sneakUntilMs = 0
+    this._wasOverAir = false
   }
 
   onTick (ctx: TickContext): ModeTickResult {
@@ -39,7 +43,6 @@ export class NormalMode extends BridgeModeBase {
     const dz = ctx.move.exitPos.z - ctx.move.entryPos.z
     const rawMovingYaw = Math.atan2(-dx, -dz)
     const movingYaw = rawMovingYaw + this.currentYawBias
-    const facingYaw = movingYaw + Math.PI
     const { dx: backX, dz: backZ } = dirFromYaw(movingYaw)
     const onGround = bot.entity.onGround
 
@@ -66,8 +69,14 @@ export class NormalMode extends BridgeModeBase {
       return result
     }
 
-    const ninjaYaw = this._snapToNinjaDiagonal(facingYaw)
-    const ninjaVec = this._ninjaStrafVec(ninjaYaw)
+    // Ninja bridge: aim at the backward‑right diagonal (movingYaw - 3π/4).
+    // In mineflayer yaw convention: 0°=North, 90°=West, 180°=South, 270°=East.
+    // Resulting facing directions for each cardinal path:
+    //   Path North → facing 225° (SE)
+    //   Path East  → facing 135° (SW)
+    //   Path South → facing  45° (NW)  ← the backward corner to place on
+    //   Path West  → facing 315° (NE)
+    const ninjaYaw = this._snapToNearestPrincipalDir(movingYaw - 3 * Math.PI / 4)
 
     const yawErr = Math.abs(shortestYawDelta(bot.entity.yaw, ninjaYaw))
     const pitchErr = Math.abs((bot.entity.pitch - this.currentPitch) * RAD2DEG)
@@ -83,9 +92,29 @@ export class NormalMode extends BridgeModeBase {
     }
 
     const overAir = this._atPlatformEdge(backX, backZ)
+    const nowMs = ctx.nowMs
+
+    // ── Smooth, humanistic sneak logic ───────────────────────────────────
+    // A real player makes one macro decision ("sneak for ~80 ms") rather than
+    // toggling sneak every tick based on raw position checks.
+    //
+    // Rising-edge trigger: arm a fresh window the FIRST tick the leading
+    //   hitbox enters air.  Suppressed if a window is already active, so
+    //   we never re-trigger mid-sneak (eliminates key-spam).
+    // Safety extension: if we're still over air when the window expires,
+    //   renew it briefly instead of letting the player step off the edge.
+    if (overAir && !this._wasOverAir && nowMs >= this._sneakUntilMs) {
+      // Leading edge just crossed into air — start a fresh sneak window.
+      this._sneakUntilMs = nowMs + randFloat(70, 90)
+    } else if (overAir && nowMs >= this._sneakUntilMs) {
+      // Window expired but player is still at the edge: brief safety renewal.
+      this._sneakUntilMs = nowMs + randFloat(40, 55)
+    }
+    this._wasOverAir = overAir
+    // ─────────────────────────────────────────────────────────────────────
 
     console.log(
-      `[ninja dbg] phase=bridge safeWalk=${ctx.nowMs < this._safeWalkUntilMs} overAir=${overAir} onGround=${onGround} ` +
+      `[ninja dbg] phase=bridge sneaking=${nowMs < this._sneakUntilMs} overAir=${overAir} onGround=${onGround} ` +
       `yaw=${(bot.entity.yaw * RAD2DEG).toFixed(1)} pitch=${(bot.entity.pitch * RAD2DEG).toFixed(1)} ` +
       `pos=(${bot.entity.position.x.toFixed(2)},${bot.entity.position.y.toFixed(2)},${bot.entity.position.z.toFixed(2)}) ` +
       `vel=(${bot.entity.velocity.x.toFixed(3)},${bot.entity.velocity.y.toFixed(3)},${bot.entity.velocity.z.toFixed(3)}) ` +
@@ -93,38 +122,34 @@ export class NormalMode extends BridgeModeBase {
     )
 
     const result: ModeTickResult = { ...DEFAULT_TICK_RESULT }
-    const inSafeWalk = ctx.nowMs < this._safeWalkUntilMs
-
-    result.wantSneak = inSafeWalk
+    result.wantSneak = nowMs < this._sneakUntilMs
     result.targetYaw = ninjaYaw
     result.targetPitch = this.currentPitch
     result.allowPlace = this.shouldBridge && this._shouldAllowPlace(ctx, backX, backZ)
     result.wantSprint = false
 
-    if (!inSafeWalk) {
-      let movX = ninjaVec.x
-      let movZ = ninjaVec.z
-      const line = ctx.lineTracker.getOptimalLine(bot, this.world)
-      if (line != null) {
-        const corr = ctx.lineTracker.getCorrectionDir(bot, line)
-        if (corr.norm() > 0.001) {
-          movX += corr.x * 0.9
-          movZ += corr.z * 0.9
-        }
+    // Move in the actual path direction (backX/backZ are derived from the path's
+    // entryPos→exitPos vector).  The ninjaYaw is ONLY for the facing/aiming
+    // direction — block placement requires looking diagonally down at the edge,
+    // but the player's feet must follow the path, not the facing vector.
+    let movX = backX
+    let movZ = backZ
+    const line = ctx.lineTracker.getOptimalLine(bot, this.world)
+    if (line != null) {
+      const corr = ctx.lineTracker.getCorrectionDir(bot, line)
+      if (corr.norm() > 0.001) {
+        // 0.3 keeps the correction gentle — large coefficients (was 0.9) caused
+        // the correction vector to overpower the path direction, flipping
+        // back+right (North) into back+left (West) when the line was bad.
+        movX += corr.x * 0.3
+        movZ += corr.z * 0.3
       }
-      let movLen = Math.sqrt(movX * movX + movZ * movZ)
-      if (movLen < 0.001) {
-        result.movementOverride = new Vec3(0, 0, 0)
-      } else {
-        const normX = movX / movLen
-        const normZ = movZ / movLen
-        if (overAir && onGround) {
-          movLen *= 0.4
-        }
-        result.movementOverride = new Vec3(normX * movLen, 0, normZ * movLen)
-      }
-    } else {
+    }
+    const movLen = Math.sqrt(movX * movX + movZ * movZ)
+    if (movLen < 0.001) {
       result.movementOverride = new Vec3(0, 0, 0)
+    } else {
+      result.movementOverride = new Vec3(movX / movLen, 0, movZ / movLen)
     }
 
     return result
@@ -139,10 +164,10 @@ export class NormalMode extends BridgeModeBase {
     const edgePos = this._computeEdgePos(bot.entity.position, backX, backZ)
     this.placementPredictor.record(bot.entity.position, edgePos)
 
-    this._safeWalkUntilMs = ctx.nowMs + randFloat(100, 150)
+    this._sneakUntilMs = ctx.nowMs + randFloat(70, 90)
 
     console.log(
-      `[ninja dbg] BLOCK PLACED placedTotal=${ctx.placedThisMove + 1} safeWalkFor=${(this._safeWalkUntilMs - ctx.nowMs).toFixed(0)}ms ` +
+      `[ninja dbg] BLOCK PLACED placedTotal=${ctx.placedThisMove + 1} sneakFor=${(this._sneakUntilMs - ctx.nowMs).toFixed(0)}ms ` +
       `pos=(${bot.entity.position.x.toFixed(2)},${bot.entity.position.y.toFixed(2)},${bot.entity.position.z.toFixed(2)}) ` +
       `yaw=${(bot.entity.yaw * RAD2DEG).toFixed(1)} pitch=${(bot.entity.pitch * RAD2DEG).toFixed(1)}`
     )
@@ -156,17 +181,26 @@ export class NormalMode extends BridgeModeBase {
     this.placementPredictor.reset()
     this.shouldBridge = false
     this.currentYawBias = 0
-    this._safeWalkUntilMs = 0
+    this._sneakUntilMs = 0
+    this._wasOverAir = false
   }
 
+  /**
+   * Returns true if the player's leading edge (0.3 blocks ahead) is over air.
+   * This triggers sneaking exactly when the edge is 0.3 blocks away.
+   */
   private _atPlatformEdge (backX: number, backZ: number): boolean {
     const bot = this.bot
     const pos = bot.entity.position
-    const groundY = Math.floor(pos.y) - 1
-    const bx = Math.round(pos.x)
-    const bz = Math.round(pos.z)
 
+    // Ground Y is the block directly below the player's feet.
+    const groundY = Math.floor(pos.y) - 1
+
+    // If the player is not on ground, we cannot reliably use the leading-edge check.
+    // Fall back to a simpler integer check (though this rarely happens during bridging).
     if (!bot.entity.onGround) {
+      const bx = Math.floor(pos.x)
+      const bz = Math.floor(pos.z)
       const stepX = Math.round(backX)
       const stepZ = Math.round(backZ)
       if (!this.world.getBlockInfo(new Vec3(bx + stepX, groundY, bz + stepZ)).physical) return true
@@ -175,20 +209,16 @@ export class NormalMode extends BridgeModeBase {
       return false
     }
 
-    const underFeet = this.world.getBlockInfo(new Vec3(bx, groundY, bz))
-    if (!underFeet.physical && !underFeet.liquid) return false
+    // On ground: check the block directly under the player's leading hitbox edge.
+    // Player width is 0.6, so leading edge is 0.3 blocks ahead in movement direction.
+    const leadX = pos.x + backX * 0.3
+    const leadZ = pos.z + backZ * 0.3
 
-    const stepX = Math.round(backX)
-    const stepZ = Math.round(backZ)
+    const blockAtLead = this.world.getBlockInfo(
+      new Vec3(Math.floor(leadX), groundY, Math.floor(leadZ))
+    )
 
-    if (stepX !== 0 && stepZ !== 0) {
-      const cardX = this.world.getBlockInfo(new Vec3(bx + stepX, groundY, bz))
-      const cardZ = this.world.getBlockInfo(new Vec3(bx, groundY, bz + stepZ))
-      if ((!cardX.physical && !cardX.liquid) || (!cardZ.physical && !cardZ.liquid)) return true
-    }
-
-    const underNext = this.world.getBlockInfo(new Vec3(bx + stepX, groundY, bz + stepZ))
-    return !underNext.physical && !underNext.liquid
+    return !blockAtLead.physical && !blockAtLead.liquid
   }
 
   private _shouldAllowPlace (ctx: TickContext, backX: number, backZ: number): boolean {
@@ -210,23 +240,21 @@ export class NormalMode extends BridgeModeBase {
     )
   }
 
-  private _snapToNinjaDiagonal (yaw: number): number {
+  /**
+   * Snaps the facing yaw to the nearest of the 8 principal directions
+   * (every 45°: cardinals + diagonals).
+   */
+  private _snapToNearestPrincipalDir (yaw: number): number {
     const D = Math.PI / 4
-    const DIAGONALS = [D, 3 * D, 5 * D, 7 * D]
+    const DIRS = [0, D, 2 * D, 3 * D, 4 * D, 5 * D, 6 * D, 7 * D]
     const wrapped = wrapRadians(yaw)
-    let best = DIAGONALS[0]
+    let best = DIRS[0]
     let bestDist = Math.abs(shortestYawDelta(wrapped, best))
-    for (let i = 1; i < DIAGONALS.length; i++) {
-      const dist = Math.abs(shortestYawDelta(wrapped, DIAGONALS[i]))
-      if (dist < bestDist) { bestDist = dist; best = DIAGONALS[i] }
+    for (let i = 1; i < DIRS.length; i++) {
+      const dist = Math.abs(shortestYawDelta(wrapped, DIRS[i]))
+      if (dist < bestDist) { bestDist = dist; best = DIRS[i] }
     }
     return best
-  }
-
-  private _ninjaStrafVec (ninjaYaw: number): Vec3 {
-    const w = wrapRadians(ninjaYaw)
-    const z = (w < Math.PI / 2 || w >= 3 * Math.PI / 2) ? 1 : -1
-    return new Vec3(0, 0, z)
   }
 
   private _nextPitch (): number {

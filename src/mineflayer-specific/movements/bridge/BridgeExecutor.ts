@@ -108,6 +108,11 @@ export class BridgeExecutor extends MovementExecutor {
     this.elevatedJumpCooldownUntilMs = 0
     this.splicedEndIndex = PathSplicer.computeSpliceEnd(this.bot, this.world, currentIndex, path)
 
+    // Seed the line tracker with the actual path direction so drift correction
+    // is active from tick 0, before any blocks have been placed.
+    const splicedTarget = path[this.splicedEndIndex] ?? thisMove
+    this.lineTracker.seedPath(thisMove.entryPos, splicedTarget.exitPos)
+
     const ctx = this._makeCtx(thisMove, currentIndex, path)
     this.mode.onMoveStart(ctx)
 
@@ -201,6 +206,22 @@ export class BridgeExecutor extends MovementExecutor {
     }
 
     const targetMove = path[this.splicedEndIndex] ?? thisMove
+
+    // Safety net: if the bot has drifted sideways and sailed past the target
+    // in the direction of travel (e.g. due to uncorrected diagonal strafe),
+    // it can never satisfy the AABB-based isComplete check.  Detect the
+    // overshoot geometrically and terminate early to prevent bridging forever.
+    if (this._hasOvershot(thisMove, targetMove)) {
+      console.log(
+        `[bridge dbg] overshoot detected — forcing completion ` +
+        `pos=(${bot.entity.position.x.toFixed(2)},${bot.entity.position.y.toFixed(2)},${bot.entity.position.z.toFixed(2)}) ` +
+        `target=(${targetMove.exitPos.x.toFixed(2)},${targetMove.exitPos.y.toFixed(2)},${targetMove.exitPos.z.toFixed(2)})`
+      )
+      this.mode.onMoveEnd()
+      this._clearSuppressPathReset()
+      return true
+    }
+
     const execComplete = this._isExecutionComplete(thisMove, targetMove, path, currentIndex)
     if (execComplete) {
       const delta = this.splicedEndIndex - currentIndex
@@ -410,6 +431,33 @@ export class BridgeExecutor extends MovementExecutor {
     bot.setControlState('back',    fwdDot < 0)
     bot.setControlState('right',   rightDot > 0)
     bot.setControlState('left',    rightDot < 0)
+  }
+
+  /**
+   * Returns true when the bot has traveled more than 1.5 blocks past the
+   * target move's exit position in the direction of the planned path.
+   *
+   * This catches the case where diagonal strafe causes sideways drift so
+   * severe that the AABB-based isComplete() can never fire (the bot is
+   * physically far from the target block and just keeps bridging forever).
+   */
+  private _hasOvershot (startMove: Move, targetMove: Move): boolean {
+    const pos = this.bot.entity.position
+    const dir = new Vec3(
+      targetMove.exitPos.x - startMove.entryPos.x,
+      0,
+      targetMove.exitPos.z - startMove.entryPos.z
+    )
+    if (dir.norm() < 0.001) return false
+    const dirN = dir.normalize()
+    // Project (botPos - target) onto the travel direction.
+    // A positive result means the bot is already past the target.
+    const toBot = new Vec3(
+      pos.x - targetMove.exitPos.x,
+      0,
+      pos.z - targetMove.exitPos.z
+    )
+    return toBot.dot(dirN) > 1.5
   }
 
   private _makeCtx (
