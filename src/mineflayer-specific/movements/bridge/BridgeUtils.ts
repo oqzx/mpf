@@ -162,31 +162,22 @@ export class OptimalLineTracker {
   }
 
   getOptimalLine (bot: Bot, world: World): Line3D | null {
+    const moveDir = getHorizontalMoveDir(bot)
+    const snapped = snapTo8Dirs(Math.atan2(moveDir.x, moveDir.z))
+    const direction = new Vec3(-Math.sin(snapped), 0, -Math.cos(snapped))
+
     const baseBlock = this._findStoodOnBlock(bot, world)
     if (baseBlock == null) return null
 
     const historyLine = this._fitLineFromHistory()
-    if (historyLine != null) {
-      // Always use the history-derived direction. It is based on actual placed
-      // block positions and is correct even when the bot faces away from the
-      // travel direction (e.g. ninja bridge faces SE but travels North).
-      // The old code derived direction from getHorizontalMoveDir, which for a
-      // SE-facing bot gave a NW-pointing line — generating a SW correction
-      // that pushed the bot West instead of keeping it on the North path.
-      return {
-        origin: new Vec3(historyLine.origin.x, bot.entity.position.y, historyLine.origin.z),
-        direction: historyLine.direction
-      }
+    let origin: Vec3
+    if (historyLine != null && historyLine.direction.dot(direction) > 0.5) {
+      origin = historyLine.origin
+    } else {
+      origin = baseBlock.offset(0.5, 0, 0.5)
     }
 
-    // No history yet — fall back to the bot's movement/facing direction.
-    const moveDir = getHorizontalMoveDir(bot)
-    const snapped = snapTo8Dirs(Math.atan2(moveDir.x, moveDir.z))
-    const direction = new Vec3(-Math.sin(snapped), 0, -Math.cos(snapped))
-    return {
-      origin: new Vec3(baseBlock.x + 0.5, bot.entity.position.y, baseBlock.z + 0.5),
-      direction
-    }
+    return { origin: new Vec3(origin.x, bot.entity.position.y, origin.z), direction }
   }
 
   getCorrectionDir (bot: Bot, line: Line3D, threshold: number = 0.15): Vec3 {
@@ -207,31 +198,19 @@ export class OptimalLineTracker {
    * are placed, so drift correction is active from the very first tick.
    * Without this, the tracker has no history and applies zero correction,
    * allowing diagonal strafe vectors to cause unchecked X/Z drift.
-   *
-   * Seeds are placed BEHIND the entry point (opposite the travel direction).
-   * Real placements happen in front of the entry and naturally extend the
-   * history in the correct forward direction.
-   *
-   * Old approach seeded [entry, exit].  After the first real block (mid-path
-   * z≈258) was added, _fitLineFromHistory used a=exit(z=237), b=block(z=258)
-   * → diff South — exactly wrong.  Two behind-entry seeds fix this: real
-   * placements always extend the sequence in the forward (North) direction.
    */
   seedPath (entryPos: Vec3, exitPos: Vec3): void {
     const dir = new Vec3(exitPos.x - entryPos.x, 0, exitPos.z - entryPos.z)
     if (dir.norm() < 0.001) return
     const n = dir.normalize()
     const y = Math.floor(entryPos.y) - 1
-    const ex = Math.floor(entryPos.x)
-    const ez = Math.floor(entryPos.z)
-    // One block step in the reverse direction on the integer grid.
-    const bx = Math.round(n.x)
-    const bz = Math.round(n.z)
-    // Two seeds behind entry: every subsequent _fitLineFromHistory call uses
-    // two forward-going real placements → correct travel direction.
+    // Two synthetic block positions along the intended path — one at the entry
+    // end and one at the exit end.  _fitLineFromHistory needs at least two
+    // points with a meaningful separation; using the full span gives the most
+    // stable direction vector.
     this.lastPlaced = [
-      new Vec3(ex - 2 * bx, y, ez - 2 * bz),
-      new Vec3(ex - bx, y, ez - bz)
+      new Vec3(Math.floor(entryPos.x), y, Math.floor(entryPos.z)),
+      new Vec3(Math.floor(exitPos.x), y, Math.floor(exitPos.z))
     ]
   }
 

@@ -138,11 +138,8 @@ export class NormalMode extends BridgeModeBase {
     if (line != null) {
       const corr = ctx.lineTracker.getCorrectionDir(bot, line)
       if (corr.norm() > 0.001) {
-        // 0.3 keeps the correction gentle — large coefficients (was 0.9) caused
-        // the correction vector to overpower the path direction, flipping
-        // back+right (North) into back+left (West) when the line was bad.
-        movX += corr.x * 0.3
-        movZ += corr.z * 0.3
+        movX += corr.x * 0.9
+        movZ += corr.z * 0.9
       }
     }
     const movLen = Math.sqrt(movX * movX + movZ * movZ)
