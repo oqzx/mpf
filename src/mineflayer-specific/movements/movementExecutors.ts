@@ -7,7 +7,7 @@ import { PlaceHandler, RayType } from './interactionUtils'
 import { AABB, AABBUtils } from '@nxg-org/mineflayer-util-plugin'
 import { CompleteOpts, MovementExecutor } from './movementExecutor'
 import { JumpCalculator, ParkourJumpHelper, getUnderlyingBBs, leavingBlockLevel, stateLookAt } from './movementUtils'
-import { EPhysicsCtx } from '@nxg-org/mineflayer-physics-util'
+import { ControlStateHandler, EPhysicsCtx, PlayerState } from '@nxg-org/mineflayer-physics-util'
 import { printBotControls } from '../../utils'
 
 export class IdleMovementExecutor extends MovementExecutor {
@@ -1056,290 +1056,243 @@ export class StraightUpExecutor extends MovementExecutor {
 export class ParkourForwardExecutor extends MovementExecutor {
   private readonly shitterTwo: ParkourJumpHelper = new ParkourJumpHelper(this.bot, this.world)
 
-  private backUpTarget?: Vec3
-
-  private reachedBackup = false
   private executing = false
-
-  private stepAmt = 1
+  private lockedYaw: number | null = null
+  private _lookAtInFlight: Promise<void> | null = null
+  private _pendingLookTarget: Vec3 | null = null
+  private readonly debug = true;
 
   protected isComplete (startMove: Move, endMove?: Move, opts: CompleteOpts = {}): boolean {
     return super.isComplete(startMove, endMove, opts)
   }
 
-  private async cheatCode (ticks = this.stepAmt): Promise<number> {
-    let counter = 0
-    await new Promise<boolean>((resolve, reject) => {
-      let leave = false
-      const listener = (): void => {
-        if (counter++ > ticks) {
-          this.bot.off('physicsTick', listener)
-          counter--
-          resolve(false)
-        }
+  private _debugLog (...args: any[]): void {
+    if (!this.debug) return
+    console.log('[ParkourForwardExecutor]', ...args)
+  }
 
-        if (leave) {
-          this.bot.off('physicsTick', listener)
-          counter--
-          resolve(true)
-        }
+  private _lockCurrentYaw (): void {
+    this.lockedYaw = this.bot.entity.yaw
+  }
 
-        if (leavingBlockLevel(this.bot, this.world, 1)) {
-          leave = true
+  private _clearLockedYaw (): void {
+    this.lockedYaw = null
+  }
+
+  private _applyLockedYaw (): void {
+    if (this.lockedYaw != null) {
+      this.bot.entity.yaw = this.lockedYaw
+    }
+  }
+
+  private _queueLookAtSync (target: Vec3): Promise<void> {
+    this._pendingLookTarget = target
+
+    if (this._lookAtInFlight != null) {
+      return this._lookAtInFlight
+    }
+
+    this._lookAtInFlight = (async () => {
+      try {
+        while (this._pendingLookTarget != null) {
+          const nextTarget = this._pendingLookTarget
+          this._pendingLookTarget = null
+          await this.bot.util.move.lookAtSync(nextTarget)
         }
+      } finally {
+        this._lookAtInFlight = null
       }
-      this.bot.entity.onGround = true
-      this.bot.on('physicsTick', listener)
-    })
+    })()
 
-    // console.log('cheat', early, counter)
-    return counter
+    return this._lookAtInFlight
+  }
+
+  private _getTargetBlock (thisMove: Move): Vec3 {
+    return thisMove.exitPos.offset(0, -1, 0)
+  }
+
+  private _getTargetEyeVec (target: Vec3): Vec3 {
+    return this.shitterTwo.findGoalVertex(AABB.fromBlockPos(target))
+  }
+
+  private _getUnderlyingBbs (thisMove: Move): AABB[] {
+    const bbs = getUnderlyingBBs(this.world, this.bot.entity.position, 0.6)
+    if (bbs.length === 0) {
+      bbs.push(AABB.fromBlockPos(thisMove.entryPos.offset(0, -1, 0)))
+    }
+    return bbs
+  }
+
+  private _getJumpState (thisMove: Move): {
+    target: Vec3
+    targetEyeVec: Vec3
+    canDirectJump: boolean
+    canJumpFromEdge: boolean
+    fallOffEdge: boolean
+  } {
+    const target = this._getTargetBlock(thisMove)
+    const targetEyeVec = this._getTargetEyeVec(target)
+    const bbs = this._getUnderlyingBbs(thisMove)
+
+    return {
+      target,
+      targetEyeVec,
+      canDirectJump: this.shitterTwo.simForwardMove(target, targetEyeVec),
+      canJumpFromEdge: this.shitterTwo.simJumpFromEdge(bbs, target),
+      fallOffEdge: this.shitterTwo.simFallOffEdge(target)
+    }
+  }
+
+  private _debugJumpState (
+    label: string,
+    jumpState: {
+      target: Vec3
+      targetEyeVec: Vec3
+      canDirectJump: boolean
+      canJumpFromEdge: boolean
+      fallOffEdge: boolean
+    }
+  ): void {
+    if (!this.debug) return
+
+    (this as any)._lastTime ??= 0;
+
+    const ectx = EPhysicsCtx.FROM_BOT(this.shitterTwo.sim.ctx, this.bot)
+    const state = this.shitterTwo.sim.predictForwardRaw(ectx, this.bot.world, 1, ectx.state.control)
+
+    this._debugLog(label,  performance.now() - (this as any)._lastTime )
+    this._debugLog(
+      'can we make it?',
+      'jump right now:', jumpState.canDirectJump,
+      'jump at ledge:', jumpState.canJumpFromEdge,
+      'fallOffEdge:', jumpState.fallOffEdge
+    )
+    this._debugLog(
+      'current bot info:',
+      this.bot.entity.yaw,
+      this.bot.entity.position,
+      this.bot.entity.velocity
+    );
+    // this._debugLog(
+    //   'simulated one tick forward info:',
+    //   state.yaw,
+    //   state.pos,
+    //   state.vel
+    // )
+
+    
+    (this as any)._lastTime = performance.now();
+
+  }
+
+  private _setApproachControls (): void {
+    this.bot.setControlState('sprint', true)
+    this.bot.setControlState('forward', true)
+    this.bot.setControlState('jump', false)
+    this.bot.setControlState('sneak', false)
+  }
+
+  private _startJumpExecution (): void {
+    this.lockedYaw = this.bot.entity.yaw
+    this.executing = true
+
+    this.bot.setControlState('sprint', true)
+    this.bot.setControlState('forward', true)
+    this.bot.setControlState('jump', true)
+    this.bot.setControlState('sneak', false)
   }
 
   async align (thisMove: Move, tickCount: number, goal: goals.Goal): Promise<boolean> {
     this.executing = false
-    const target = thisMove.exitPos.offset(0, -1, 0)
+    this._clearLockedYaw()
 
-    const targetEyeVec = this.shitterTwo.findGoalVertex(AABB.fromBlockPos(target))
-    const test2 = this.shitterTwo.simFallOffEdge(target)
+    const jumpState = this._getJumpState(thisMove)
+    const { target, targetEyeVec, canDirectJump, canJumpFromEdge, fallOffEdge } = jumpState
 
-    if (test2) {
+    this._debugJumpState('align', jumpState)
+
+    if (fallOffEdge) {
       this.executing = true
+      void this._queueLookAtSync(target)
+      this._lockCurrentYaw()
+
       this.bot.setControlState('sprint', true)
       this.bot.setControlState('forward', true)
       this.bot.setControlState('jump', false)
-      // this.reachedBackup = true;
-      // this.bot.setControlState("sneak", false);
-      void this.lookAtPathPos(target)
       return true
     }
 
-    // return true;
-
-    const bbs = getUnderlyingBBs(this.world, this.bot.entity.position, 0.6)
-
-    if (bbs.length === 0) {
-      bbs.push(AABB.fromBlockPos(thisMove.entryPos.offset(0, -1, 0)))
+    if (!this.bot.entity.onGround) {
+      return false
     }
 
-    // console.log('CALLED TEST IN ALIGN')
-    const test0 = this.shitterTwo.simForwardMove(target)
-    const test1 = this.shitterTwo.simJumpFromEdge(bbs, target)
-
-    // console.log('align', test0, test1, test2, this.bot.entity.onGround)
-
-    // if (!this.bot.entity.onGround) return false;
-    if (this.bot.entity.onGround) {
-      if (test0) {
-        this.bot.setControlState('sprint', true)
-        this.bot.setControlState('forward', true)
-        this.bot.setControlState('jump', true)
-        this.bot.setControlState('sneak', false)
-        this.bot.setControlState('jump', false)
-        void this.lookAt(targetEyeVec)
-        this.executing = true
-        return true
-      }
-      if (test1) {
-        this.bot.setControlState('sprint', true)
-        this.bot.setControlState('forward', true)
-        // this.reachedBackup = true;
-        // this.bot.setControlState("sneak", false);
-        void this.lookAt(targetEyeVec)
-        return false
-      }
+    if (canDirectJump) {
+      void this._queueLookAtSync(targetEyeVec)
+      this._startJumpExecution()
+      return true
     }
 
-    // return true;
-
-    const bb = AABBUtils.getPlayerAABB({ position: this.bot.entity.position, width: 0.3, height: 1.8 }).extend(0, -0.252, 0)
-    // const xzvdir = this.bot.entity.velocity.offset(0, -this.bot.entity.velocity.y, 0).normalize()
-    // const dir = target.minus(this.bot.entity.position).normalize()
-
-    // const offset = this.bot.entity.position.minus(thisMove.exitPos).plus(this.bot.entity.position)
-    const ctx = EPhysicsCtx.FROM_BOT(this.bot.physicsUtil.engine, this.bot)
-    //
-    // assume moving forward.
-    const xzVel = this.bot.entity.velocity.offset(0, -this.bot.entity.velocity.y, 0)
-    if (xzVel.norm() < 0.03) {
-      stateLookAt(ctx.state, targetEyeVec)
-      ctx.state.control.set('forward', true)
-      ctx.state.control.set('sprint', true)
+    if (canJumpFromEdge) {
+      void this._queueLookAtSync(targetEyeVec)
+      this._setApproachControls()
+      return false
     }
 
-    const goingToFall = leavingBlockLevel(this.bot, this.world, this.stepAmt, ctx)
-
-    // console.log(goingToFall, this.bot.entity.position)
-
-    if (!goingToFall && this.backUpTarget != null && bb.containsVec(this.backUpTarget)) {
-      this.reachedBackup = true
-      // const dist = this.bot.entity.position.xzDistanceTo(this.backUpTarget)
-      // console.log('here1', this.bot.entity.position, this.backUpTarget, dist)
-      await this.lookAtPathPos(targetEyeVec)
-
-      this.bot.setControlState('forward', true)
-      this.bot.setControlState('sprint', true)
-      // this.bot.setControlState('sneak', xzvdir.dot(dir) < 0.2 && true)
-    } else if (this.bot.entity.onGround && goingToFall && this.backUpTarget == null) {
-      this.stepAmt = 1
-      this.reachedBackup = false
-      this.backUpTarget = this.shitterTwo.findBackupVertex(bbs, target)
-      // // const dist = this.bot.entity.position.xzDistanceTo(this.backUpTarget)
-
-      // console.log('here2', this.backUpTarget, this.bot.entity.position)
-
-      // behold, our first cheat.
-
-      const oldY = this.bot.entity.position.y
-
-      await this.cheatCode(2)
-
-      const currentY = this.bot.entity.position.y
-      // console.log('new pos', this.bot.entity.position, early)
-
-      this.bot.entity.onGround = true
-      this.bot.entity.position.y = oldY
-      const res = this.shitterTwo.simForwardMove(target)
-
-      // console.log('res', res, early)
-      if (res) {
-        this.bot.setControlState('forward', true)
-        this.bot.setControlState('sprint', true)
-        this.bot.setControlState('jump', true)
-        this.executing = true
-        return true
-      } else {
-        this.bot.entity.position.y = currentY
-        await this.lookAt(this.backUpTarget)
-        this.bot.setControlState('forward', true)
-        this.bot.setControlState('sprint', true)
-        //  this.bot.setControlState('sneak', dist < 0)
-      }
-    } else if (goingToFall && this.backUpTarget != null && this.reachedBackup) {
-      const oldY = this.bot.entity.position.y
-
-      // console.log('here5', this.bot.entity.position)
-      await this.cheatCode()
-
-      const currentY = this.bot.entity.position.y
-      // console.log('new pos', this.bot.entity.position, early)
-      printBotControls(this.bot)
-      this.bot.entity.onGround = true
-      this.bot.entity.position.y = oldY
-      const res = this.shitterTwo.simForwardMove(target)
-
-      // console.log('res', res, early)
-      if (res) {
-        this.bot.setControlState('forward', true)
-        this.bot.setControlState('sprint', true)
-        this.bot.setControlState('jump', true)
-        this.executing = true
-        return true
-      } else {
-        this.bot.entity.position.y = currentY
-        await this.lookAtPathPos(this.backUpTarget)
-        this.bot.clearControlStates()
-        this.bot.setControlState('forward', true)
-        this.bot.setControlState('sneak', true)
-        await this.bot.waitForTicks(1)
-        this.stepAmt = 1
-        delete this.backUpTarget
-        this.reachedBackup = false
-        throw new CancelError('ParkourExecutor: will not make this jump!')
-      }
-    } else if (!this.reachedBackup && this.backUpTarget != null) {
-      const dist = this.bot.entity.position.xzDistanceTo(this.backUpTarget)
-      // console.log('here3', this.bot.entity.position, this.backUpTarget)
-
-      void this.lookAtPathPos(this.backUpTarget)
-      this.bot.setControlState('forward', true)
-      this.bot.setControlState('sprint', dist > 0)
-      // this.bot.setControlState('sneak', dist < 0 && false)
-    } else {
-      // const state = this.bot.physicsUtil.engine.simulate(EPhysicsCtx.FROM_BOT(this.bot.physicsUtil.engine, this.bot), this.world)
-      // if (state.pos.y < this.bot.entity.position.y) {
-      // console.trace("HI", state.pos, this.bot.entity.position)
-      //   this.bot.setControlState('sneak', true)
-      //   // throw new CancelError('ParkourForward: Not making this jump.')
-      // } else {
-      this.bot.clearControlStates()
-      // console.log('here4', this.bot.entity.position, this.backUpTarget)
-
-      void this.lookAtPathPos(targetEyeVec)
-      this.bot.setControlState('forward', true)
-      this.bot.setControlState('sprint', true)
-      // this.bot.setControlState('sneak', xzvdir.dot(dir) < 0.3 && false)
-
-      // }
-    }
-
-    // console.log('done')
-
+    this.bot.clearControlStates()
+    this._queueLookAtSync(targetEyeVec)
+    this._setApproachControls()
     return false
   }
 
   async performInit (thisMove: Move, currentIndex: number, path: Move[]): Promise<void> {
-    delete this.backUpTarget
-    this.reachedBackup = false
-    // await this.postInitAlignToPath(thisMove)
-    // await this.lookAtPathPos(thisMove.exitPos);
-    // this.bot.chat(`/particle flame ${thisMove.exitPos.x} ${thisMove.exitPos.y} ${thisMove.exitPos.z} 0 0.5 0 0 10 force`)
+    this.executing = false
+    this._clearLockedYaw()
 
-    // this.jumpInfo = this.shitter.findJumpPoint(thisMove.exitPos);
+    const target = this._getTargetBlock(thisMove)
+    const targetEyeVec = this._getTargetEyeVec(target)
 
-    // this.bot.setControlState("sprint", true);
-    // this.bot.setControlState("forward", true);
+    // await this.bot.this._queueLookAtSync(targetEyeVec)
   }
 
-  // TODO: Fix this. Good thing I've done this before. >:)
   performPerTick (thisMove: Move, tickCount: number, currentIndex: number, path: Move[]): boolean | Promise<boolean> {
-    // console.log('in per tick', tickCount)
-    // printBotControls(this.bot)
-
-    const targetEyeVec = this.shitterTwo.findGoalVertex(AABB.fromBlockPos(thisMove.exitPos))
-    // if (!this.bot.entity.onGround && !this.executing) return false;
-    // this.bot.clearControlStates()
     if (this.executing) {
       this.bot.setControlState('jump', false)
-      // console.log(this.bot.entity.position)
-      void this.postInitAlignToPath(thisMove, { lookAtYaw: targetEyeVec })
+      this._applyLockedYaw()
       return this.isComplete(thisMove)
     }
 
-    const target = thisMove.exitPos.offset(0, -1, 0)
-    // const targetVec = this.shitterTwo.findGoalVertex(AABB.fromBlockPos(target))
+    const jumpState = this._getJumpState(thisMove)
+    const { targetEyeVec, canDirectJump, canJumpFromEdge } = jumpState
 
-    const bbs = getUnderlyingBBs(this.world, this.bot.entity.position, 0.6)
-    if (bbs.length === 0) {
-      bbs.push(AABB.fromBlockPos(thisMove.entryPos))
-    }
+    this._debugJumpState('tick', jumpState)
 
     void this.postInitAlignToPath(thisMove, { lookAtYaw: targetEyeVec })
-    // this.lookAtPathPos(thisMove.exitPos)
 
-    // console.log('CALLED TEST IN PER TICK', this.bot.entity.position, this.shitterTwo.getUnderlyingBBs(this.bot.entity.position,0.6))
-    const test = this.shitterTwo.simForwardMove(target)
-    const test1 = this.shitterTwo.simJumpFromEdge(bbs, target)
-    // console.log(test, test1, target);
-    // if (this.cI && !this.cI.allowExternalInfluence(this.bot, 5)) {
-    //   this.bot.clearControlStates();
-    //   return false;
-    // }
-
-    // console.log('per tick', test, test1)
-
-    if (test) {
-      this.bot.setControlState('sprint', true)
-      this.bot.setControlState('forward', true)
-      this.bot.setControlState('jump', true)
-      this.executing = true
-    } else if (test1) {
-      this.bot.setControlState('sprint', true)
-      this.bot.setControlState('forward', true)
-    } else {
-      // this.alignToPath(thisMove);
+    if (canDirectJump) {
+      this._startJumpExecution()
+      return false
     }
 
-    return false
+    if (canJumpFromEdge) {
+      this._clearLockedYaw()
+      this._setApproachControls()
+      return false
+    }
+
+    if (!this.bot.entity.onGround) {
+      this._clearLockedYaw()
+      throw new CancelError('ParkourExecutor: missed jump window')
+    }
+
+    this._clearLockedYaw()
+    this.bot.clearControlStates()
+    this._debugLog('WE WILL FAIL!!!')
+    throw new CancelError('ParkourExecutor: will not make this jump!')
+  }
+
+  isAlreadyCompleted (thisMove: Move, tickCount: number, goal: goals.Goal): boolean {
+    const ret = this.isComplete(thisMove)
+    this._debugLog('parkour complete?', ret)
+    return ret
   }
 }
