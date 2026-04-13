@@ -500,7 +500,7 @@ export class ThePathfinder {
       astarContext = res.astarContext
       _dbgIter++
       if (_dbgIter % 50 === 0 || _dbgIter <= 5) {
-        const bn = this.handler?.bestNode ?? (this._currentProducer as any)?.astarContext?.bestNode
+        const bn = (this._currentProducer as any)?.astarContext?.bestNode
         const bnPos = bn?.data ? `(${bn.data.x?.toFixed?.(1) ?? bn.data.x}, ${bn.data.y?.toFixed?.(1) ?? bn.data.y}, ${bn.data.z?.toFixed?.(1) ?? bn.data.z})` : 'n/a'
         const closedSz = (this._currentProducer as any)?.astarContext?.closedDataSet?.size ?? '?'
         const openSz = (this._currentProducer as any)?.astarContext?.openHeap?.size?.() ?? '?'

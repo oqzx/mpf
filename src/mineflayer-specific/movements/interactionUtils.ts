@@ -238,27 +238,6 @@ export class PlaceHandler extends InteractHandler {
     ]
   }
 
-  faceToVec (face: BlockFace): Vec3 {
-    switch (face) {
-      case BlockFace.BOTTOM:
-        return new Vec3(0, -1, 0)
-      case BlockFace.TOP:
-        return new Vec3(0, 1, 0)
-
-      case BlockFace.NORTH:
-        return new Vec3(0, 0, -1)
-      case BlockFace.SOUTH:
-        return new Vec3(0, 0, 1)
-      case BlockFace.WEST:
-        return new Vec3(-1, 0, 0)
-      case BlockFace.EAST:
-        return new Vec3(1, 0, 0)
-
-      default:
-        throw new Error('Invalid face')
-    }
-  }
-
   needToPerform (bot: Bot): boolean {
     // check if block at position is already what we want it to be
     const blockInfo = bot.pathfinder.world.getBlockInfo(this.vec)
@@ -343,7 +322,7 @@ export class PlaceHandler extends InteractHandler {
               PlaceHandler.reach / scale
             )) as unknown as RayType
             if (rayRes === null) continue
-            const pos = rayRes.position.plus(this.faceToVec(rayRes.face))
+            const pos = rayRes.position.plus(faceToVec(rayRes.face))
             if (pos.equals(this.vec)) {
               if (bb1.containsVec(rayRes.intersect)) continue
               if (AABB.fromBlock(pos).intersects(bb1)) {
@@ -426,7 +405,7 @@ export class PlaceHandler extends InteractHandler {
         const rayRes = works.raycasts[0]
         if (rayRes === undefined) throw new Error('Invalid block')
 
-        const pos = rayRes.position.plus(this.faceToVec(rayRes.face))
+        const pos = rayRes.position.plus(faceToVec(rayRes.face))
         // const posBlRef = AABB.fromBlockPos(rayRes.position)
         const posBl = AABB.fromBlock(pos)
 
@@ -448,7 +427,7 @@ export class PlaceHandler extends InteractHandler {
 
           if (testCheck === null) break
 
-          const pos1 = testCheck.position.plus(this.faceToVec(testCheck.face))
+          const pos1 = testCheck.position.plus(faceToVec(testCheck.face))
           const pos1Bl = AABB.fromBlock(pos1)
           if (testCheck.position.equals(rayRes.position) && testCheck.face === rayRes.face && !state.getBB().intersects(pos1Bl)) {
             // console.log("skipping on tick", i, state.getBB(), state.pos, pos1Bl);
@@ -467,7 +446,7 @@ export class PlaceHandler extends InteractHandler {
           await bot.lookAt(rayRes.intersect, this.settings.forceLook)
         }
 
-        // console.log(i, works.ticks, works.tickAllowance, works.shiftTick, rayRes.intersect, this.faceToVec(rayRes.face));
+        // console.log(i, works.ticks, works.tickAllowance, works.shiftTick, rayRes.intersect, faceToVec(rayRes.face));
         // console.log(bot.entity.position, bot.entity.velocity);
 
         const invalidPlacement = botBB.intersects(posBl)
@@ -480,7 +459,7 @@ export class PlaceHandler extends InteractHandler {
 
         let finished = false
         let sneaking = false
-        const direction = this.faceToVec(rayRes.face)
+        const direction = faceToVec(rayRes.face)
         // console.log("looking at", rayRes.intersect);
         // start = performance.now()
         this._placeTask = bot._placeBlockWithOptions(rayRes, direction, { forceLook: 'ignore', swingArm: 'right' })
@@ -675,5 +654,27 @@ export class BreakHandler extends InteractHandler {
       }
       await this._breakTask.catch(() => {})
     }
+  }
+}
+
+
+export function faceToVec (face: BlockFace): Vec3 {
+  switch (face) {
+    case BlockFace.BOTTOM:
+      return new Vec3(0, -1, 0)
+    case BlockFace.TOP:
+      return new Vec3(0, 1, 0)
+
+    case BlockFace.NORTH:
+      return new Vec3(0, 0, -1)
+    case BlockFace.SOUTH:
+      return new Vec3(0, 0, 1)
+    case BlockFace.WEST:
+      return new Vec3(-1, 0, 0)
+    case BlockFace.EAST:
+      return new Vec3(1, 0, 0)
+
+    default:
+      throw new Error('Invalid face')
   }
 }

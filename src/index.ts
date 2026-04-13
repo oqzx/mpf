@@ -49,6 +49,11 @@ declare module 'mineflayer' {
   }
 }
 
+export * as pathProducers from './mineflayer-specific/pathProducers'
+export * as movementProviders from './mineflayer-specific/movements/movementProviders'
+export * as movementExecutors from './mineflayer-specific/movements/movementExecutors'
+
+export { BuildableMoveProvider, BuildableMoveExecutor, MovementSetup, Movement } from './mineflayer-specific/movements'
+
 export * as goals from './mineflayer-specific/goals'
 export * as custom from './mineflayer-specific/custom'
-export * from './mineflayer-specific/movements/bridge'
