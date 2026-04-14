@@ -10,6 +10,7 @@ import { AABB, AABBUtils, Task } from '@nxg-org/mineflayer-util-plugin'
 import { BaseSimulator, Controller, EPhysicsCtx, EntityPhysics, PlayerState, SimulationGoal } from '@nxg-org/mineflayer-physics-util'
 import { botStrafeMovement, botSmartMovement, botStrafeMovementStrict } from './controls'
 import { getNormalizedPos } from '../../utils'
+import { BotcraftPhysics, IPhysics } from '@nxg-org/mineflayer-physics-util/dist/physics/engines'
 
 // temp typing
 interface AbortOpts {
@@ -34,7 +35,7 @@ export abstract class MovementExecutor extends Movement {
   protected simCtx: EPhysicsCtx<PlayerState>
 
   /** */
-  protected engine: EntityPhysics
+  protected engine: IPhysics
 
   /**
    * Return the current interaction.
@@ -59,7 +60,7 @@ export abstract class MovementExecutor extends Movement {
 
   public constructor(bot: Bot, world: World, settings: Partial<MovementOptions> = {}) {
     super(bot, world, settings)
-    this.engine = new EntityPhysics(bot.registry)
+    this.engine = new BotcraftPhysics(bot.registry)
     this.sim = new BaseSimulator(this.engine)
     this.simCtx = EPhysicsCtx.FROM_BOT(this.engine, bot)
   }

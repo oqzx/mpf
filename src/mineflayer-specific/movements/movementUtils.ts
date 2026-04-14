@@ -15,6 +15,7 @@ import { AABB, AABBUtils } from '@nxg-org/mineflayer-util-plugin'
 import { JumpSim } from './simulators/jumpSim'
 import { Block } from '../../types'
 import type { PCChunk } from 'prismarine-chunk'
+import { IPhysics } from '@nxg-org/mineflayer-physics-util/dist/physics/engines'
 
 interface JumpInfo {
   jumpTick: number
